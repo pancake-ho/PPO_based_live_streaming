@@ -1,0 +1,20 @@
+# Python 필수
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# 연구 데이터 (용량 큰 것들)
+*.mp4
+*.avi
+*.yuv
+*.pth
+*.pt
+*.pdf
+*.mpd
+*.csv
+*.npy
+*.txt
+baseline/data/
+logs/
+baseline/gst/
