@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-from dash_adapter import BigBuckBunnyDataset, sintelDataset, Swiss_Dataset, Elephants_Dataset, Forest_men_Dataset
+from baseline.data.dash_adapter import BigBuckBunnyDataset, sintelDataset, Swiss_Dataset, Elephants_Dataset, Forest_men_Dataset
 from pathlib import Path
 
 

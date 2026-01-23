@@ -35,8 +35,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from ALVS_B4 import ActorNetwork_ALVS
-from TCLivi_B5 import ActorNetworkTCLiVi
+from baseline.train.B4.ALVS_B4 import ActorNetwork_ALVS
+from baseline.train.B5.TCLivi_B5 import ActorNetworkTCLiVi
 
 # ----------------------------
 # Utils: dynamic import
