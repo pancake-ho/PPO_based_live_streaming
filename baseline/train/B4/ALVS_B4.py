@@ -12,33 +12,22 @@ from torch.distributions import Categorical
 import torch.multiprocessing as mp
 import sys
 
+try:
+    from proposed import DynamicChannelModel
+except ImportError:
+    print("오류: proposed.py 파일을 찾거나 불러올 수 없습니다.")
+    print("파일명을 확인하거나 구체적인 경로를 확인해주세요.")
+    exit()
+
 # 전역 장치 정의
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- 환경 및 채널 모델 코드 (변경 없음) ---
-class DynamicChannelModel:
-    def __init__(self, W=1e6, gamma_dB=35, distance=20, beta=2, sigma_dB=4, mu_dB=0):
-        self.W, self.gamma, self.distance, self.beta, self.sigma_dB, self.mu_dB = W, 10**(gamma_dB/10), distance, beta, sigma_dB, mu_dB
-        self.current_channel_gain, self.current_capacity, self.channel_components = None, None, None
-    
-    def generate_channel_state(self):
-        path_loss = self.distance ** self.beta
-        shadowing = 10 ** (np.random.normal(self.mu_dB, self.sigma_dB) / 10)
-        fast_fading = np.abs(np.random.normal(0, 1/np.sqrt(2)) + 1j * np.random.normal(0, 1/np.sqrt(2))) ** 2
-        self.current_channel_gain = np.sqrt((1 / path_loss) * shadowing * fast_fading)
-    
-    def calculate_capacity(self, regenerate_channel=True):
-        if regenerate_channel or self.current_channel_gain is None: self.generate_channel_state()
-        capacity_bps = self.W * np.log2(1 + self.gamma * (self.current_channel_gain ** 2))
-        self.current_capacity = capacity_bps / 8
-        return self.current_capacity
 
 from collections import deque
 
 class VideoStreamingEnvCombined:
     # --- MODIFIED: 새로운 매개변수 및 기록 추가 ---
     def __init__(self, num_chunks=300, t_buffer=4, t_i=2, 
-                 W1=2.5, W2=1.5, W3=0.1, W4=0.005, # ALVS reward weights: c0, c1, c3, c2
+                 W1=1, W2=300, W3=100, W_tau=1, # ALVS reward weights: c0, c1, c3, c2
                  history_len=8, verbose=False, snr_db=35.0):
         
         # 핵심 매개변수
