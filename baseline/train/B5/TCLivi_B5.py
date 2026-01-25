@@ -536,8 +536,10 @@ class PPOAgent_TCLiVi:
         self.clear_memory()
         
     def save_models(self, episode, prefix="TCLiVi_rule_based_speed"):
-        torch.save(self.actor.state_dict(), f'baseline/train/B5/models/{prefix}_actor_ep{episode}.pth')
-        torch.save(self.critic.state_dict(), f'baseline/train/B5/models/{prefix}_critic_ep{episode}.pth')
+        base_path = os.path.join(os.getcwd(), 'models')
+
+        torch.save(self.actor.state_dict(), os.path.join(base_path,f"{prefix}_actor_ep{episode}.pth"))
+        torch.save(self.critic.state_dict(), os.path.join(base_path, f"{prefix}_critic_ep{episode}.pth"))
         print(f"TCLiVi 모델 (규칙 기반 속도)이 에피소드 {episode}에 저장되었습니다")
 
 #################################

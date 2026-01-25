@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os
+import sys
 import numpy as np
 import time
 from collections import deque
@@ -10,44 +11,55 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 import torch.multiprocessing as mp
-import sys
+
+from collections import deque
+
+# Proposed.py 로부터 요소들을 가져오기 위한 과정
+current_dir = os.path.dirname(os.path.abspath(__path__))
+proposed_dir = os.path.join(current_dir, '../proposed')
+sys.path.append(proposed_dir)
 
 try:
     from proposed import DynamicChannelModel
-except ImportError:
+except ImportError as e:
     print("오류: proposed.py 파일을 찾거나 불러올 수 없습니다.")
     print("파일명을 확인하거나 구체적인 경로를 확인해주세요.")
+    print(f"오류 메시지는 다음과 같습니다: {e}")
     exit()
 
 # 전역 장치 정의
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"--- ALVS 베이스라인 ---")
+print(f"사용 장치: {device}")
 
-from collections import deque
-
-class VideoStreamingEnvCombined:
+class VideoStreamingEnv_ALVS:
     # --- MODIFIED: 새로운 매개변수 및 기록 추가 ---
     def __init__(self, num_chunks=300, t_buffer=4, t_i=2, 
-                 W1=1, W2=300, W3=100, W_tau=1, # ALVS reward weights: c0, c1, c3, c2
+                 W1=1, W2=300, W3=100, W_tau=1,
                  history_len=8, verbose=False, snr_db=35.0):
         
         # 핵심 매개변수
-        self.num_chunks, self.t_buffer, self.t_i = num_chunks, t_buffer, t_i
+        self.num_chunks = num_chunks
+        self.t_buffer = t_buffer
+        self.t_i = t_i
         
-        # 원본 논문의 비트레이트 및 화질 레벨 매핑
-        self.quality_levels = [1, 2, 3, 4]
-        self.bitrate_map = {1: 0.8, 2: 1.2, 3: 2.4, 4: 4.8} # Mbps
+        # DASH-Train 구조에 맞춰 시스템 구조 변경
+        self.quality_levels = list(range(1, 21))
+        self.max_quality = max(self.quality_levels)
+        self.W1, self.W2, self.W3, self.W_tau = W1, W2, W3, W_tau
         
-        # ALVS 동작 공간
-        # ALVS 논문은 6개 화질과 3개 속도를 사용하지만, 여기서는 호환성을 위해 
-        # 4개 화질을 유지하고 속도는 ALVS의 3개를 사용합니다.
-        # 완전히 일치시키려면 self.bitrate_map을 수정하십시오.
         self.playback_speeds = [0.9, 1.0, 1.1]
-        
+        self.num_speed_levels = len(self.playback_speeds)
+
+        self.bitrate_map = {
+            1: 0.045,   2: 0.089,   3: 0.131,   4: 0.178,   5: 0.221,
+            6: 0.262,   7: 0.334,   8: 0.396,   9: 0.522,   10: 0.595,
+            11: 0.791,  12: 1.032,  13: 1.244,  14: 1.546,  15: 2.133,
+            16: 2.484,  17: 3.078,  18: 3.526,  19: 3.840,  20: 4.219
+        }
+
         # 채널 모델
-        self.channel_model = DynamicChannelModel(gamma_dB=snr_db)
-        
-        # 보상 가중치 (W1=c0, W2=c1, W3=c3, W4=c2)
-        self.W1, self.W2, self.W3, self.W4 = W1, W2, W3, W4
+        self.channel_model = DynamicChannelModel()
         self.verbose = verbose
         
         # ALVS 상태 기록
@@ -58,8 +70,10 @@ class VideoStreamingEnvCombined:
     def reset(self):
         # 시뮬레이션 상태 변수
         self.interval_capacities, self.actual_completion_times, self.chunk_actions = {}, {}, {}
+        self.chunk_play_end_times = {}
         self.generated_chunk_times = {i: (i + 1) * self.t_i for i in range(self.num_chunks)}
-        self.u_i, self.p_i, self.d_i, self.k_j, self.speed_idx_j, self.l_i, self.x_j = [], [], [], [], [], [], []
+        self.u_i, self.p_i, self.d_i, self.k_j, self.speed_idx_j, self.l_i, self.x_j, self.received_chunks = [], [], [], [], [], [], [], []
+        self.tau_i = []
         self.current_chunk_idx = 0
         
         # ALVS 고유 기록 상태
@@ -70,81 +84,180 @@ class VideoStreamingEnvCombined:
         # 초기 상태 가져오기
         return self.get_state_for_decision(0)
 
-    # _calculate_live_latency 및 calculate_remaining_play_time은 수정 불필요
-    def _calculate_live_latency(self, calculation_time_ui, decision_chunk_idx):
-        currently_playing_chunk_idx, last_played_chunk_info = -1, None
-        for j in range(decision_chunk_idx - 1, -1, -1):
-            info = self.chunk_actions.get(j)
-            if info and info.get('x', 0) == 0 and j < len(self.p_i) and self.p_i[j] <= calculation_time_ui:
-                currently_playing_chunk_idx, last_played_chunk_info = j, info; break
-        if currently_playing_chunk_idx == -1: return self.t_buffer
-        p_n_i = self.p_i[currently_playing_chunk_idx]
-        sum_of_prev_play_durations = sum(self.t_i / info.get('speed', 1.0) for j, info in self.chunk_actions.items() if j < currently_playing_chunk_idx and info.get('x', 0) == 0)
-        historical_lag = p_n_i - sum_of_prev_play_durations
-        current_chunk_speed, current_chunk_play_duration = last_played_chunk_info.get('speed', 1.0), self.t_i / last_played_chunk_info.get('speed', 1.0)
-        current_chunk_theoretical_end_time = p_n_i + current_chunk_play_duration
-        current_stall_lag = max(0, calculation_time_ui - current_chunk_theoretical_end_time)
-        return historical_lag + current_stall_lag
-        
     def calculate_remaining_play_time(self, calculation_time, decision_chunk_idx):
-        remaining_current, future_buffered, playing_idx = 0.0, 0.0, -1
+        """
+        计算缓冲区剩余播放时间 (Combined Version)
+        需要考虑跳过的块 (x=1) 不贡献缓冲时间。
+        """
+        remaining_current_chunk_time = 0.0
+        future_buffered_time = 0.0
+        currently_playing_chunk_idx = -1
+        current_chunk_speed = 1.0
+
+        # 1. Find currently playing chunk (must not be skipped)
         for j in range(decision_chunk_idx):
-            info = self.chunk_actions.get(j)
-            if info and info.get('x', 0) == 0 and j < len(self.p_i) and self.p_i[j] != float('inf'):
-                start, speed = self.p_i[j], info.get('speed', 1.0)
-                end = start + self.t_i / speed
-                if start <= calculation_time < end:
-                    remaining_current, playing_idx = max(0, end - calculation_time), j; break
-        for j in range(playing_idx + 1, decision_chunk_idx):
-            info = self.chunk_actions.get(j)
-            if info and info.get('x', 0) == 0 and self.actual_completion_times.get(j, float('inf')) <= calculation_time:
-                future_buffered += self.t_i / info.get('speed', 1.0)
-        return remaining_current + future_buffered
+            action_info = self.chunk_actions.get(j)
+            # Check if chunk j was played (had action, NOT skipped, valid play start time)
+            if action_info and action_info.get('x', 0) == 0 and j < len(self.p_i) and self.p_i[j] != float('inf'):
+                play_start_time = self.p_i[j]
+                chunk_speed = action_info.get('speed', 1.0)
+                play_duration = self.t_i / chunk_speed
+                play_end_time = play_start_time + play_duration
 
-    # _get_capacity_for_interval 및 _simulate_chunk_transmission은 수정 불필요
+                if play_start_time <= calculation_time < play_end_time:
+                    remaining_current_chunk_time = max(0, play_end_time - calculation_time)
+                    currently_playing_chunk_idx = j
+                    current_chunk_speed = chunk_speed
+                    break
+
+        # 2. Calculate future buffered time (must not be skipped, received, not started)
+        start_index_for_future = currently_playing_chunk_idx + 1
+        for j in range(start_index_for_future, decision_chunk_idx):
+            action_info = self.chunk_actions.get(j)
+            # Check if chunk j is: (1) has action, (2) NOT skipped, (3) is received, (4) not started playing
+            if action_info and action_info.get('x', 0) == 0: # (1, 2) Has action and not skipped
+                completion_time = self.actual_completion_times.get(j, float('inf'))
+                if completion_time <= calculation_time: # (3) Is received
+                     play_start = self.p_i[j] if j < len(self.p_i) else float('inf')
+                     if play_start > calculation_time : # (4) Not started playing
+                         chunk_speed = action_info.get('speed', 1.0)
+                         future_buffered_time += self.t_i / chunk_speed # Use speed-adjusted duration
+
+        total_remaining_time = remaining_current_chunk_time + future_buffered_time
+        return total_remaining_time
+    
     def _get_capacity_for_interval(self, interval_index):
-        if interval_index < 0: return 0
-        return self.interval_capacities.setdefault(interval_index, self.channel_model.calculate_capacity(True))
+        """获取或生成指定时间间隔的信道容量 (bytes/sec)"""
+        if interval_index < 0: # 处理可能的边界情况
+             return 0 # 或者返回一个默认值？取决于逻辑
+        if interval_index not in self.interval_capacities:
+            # 为这个新的时间间隔生成信道容量
+            capacity = self.channel_model.calculate_capacity(regenerate_channel=True)
+            self.interval_capacities[interval_index] = capacity
 
+            if self.verbose:
+                channel_details = self.channel_model.get_channel_details()
+                start_t = interval_index * self.t_i
+                end_t = (interval_index + 1) * self.t_i
+
+        return self.interval_capacities[interval_index]
+    
     def _simulate_chunk_transmission(self, chunk_idx, k_i, start_time):
-        size_to_transmit = (self.bitrate_map[k_i] * 1_000_000 * self.t_i) / 8
-        if size_to_transmit <= 1e-9: return 0.0, start_time
-        transmitted_data, current_time, total_tx_time = 0.0, start_time, 0.0
-        max_sim_time = start_time + 10 * self.num_chunks * self.t_i
-        while transmitted_data < size_to_transmit and current_time < max_sim_time:
+        """
+        模拟单个块的传输过程，考虑跨越多个信道间隔。
+        返回实际传输时间和完成时间。
+        """
+        bitrate_mbps = self.bitrate_map[k_i]
+
+        # Formula: Size (Bytes) = (Bitrate (Mbps) * 1,000,000 bits/Mb * Duration (s)) / 8 bits/byte
+
+        size_to_transmit = (bitrate_mbps * 1_000_000 * self.t_i) / 8
+
+        if size_to_transmit <= 1e-9: # 如果块大小为0
+            return 0.0, start_time
+
+        transmitted_data = 0.0
+        current_time = start_time
+        total_transmission_time = 0.0
+
+        max_simulation_time = start_time + 10 * self.num_chunks * self.t_i # 设置一个模拟时间上限，防止无限循环
+
+        while transmitted_data < size_to_transmit and current_time < max_simulation_time:
             interval_idx = int(current_time // self.t_i)
-            capacity, interval_end_time = self._get_capacity_for_interval(interval_idx), (interval_idx + 1) * self.t_i
-            time_in_interval = interval_end_time - current_time
-            if capacity <= 1e-9:
-                total_tx_time += time_in_interval + 1e-9; current_time += time_in_interval + 1e-9; continue
-            time_needed = (size_to_transmit - transmitted_data) / capacity
-            time_this_interval = min(time_in_interval, time_needed)
-            transmitted_data += capacity * time_this_interval
-            total_tx_time += time_this_interval; current_time += time_this_interval
-        if current_time >= max_sim_time: return float('inf'), float('inf')
-        return total_tx_time, start_time + total_tx_time
+            capacity = self._get_capacity_for_interval(interval_idx)
+
+            # 计算当前时间点到当前间隔结束还剩多少时间
+            interval_end_time = (interval_idx + 1) * self.t_i
+            time_left_in_interval = interval_end_time - current_time
+
+            if capacity <= 1e-9: # 信道容量几乎为0
+                # 如果容量为0且还有数据未传输，理论上会无限期卡住
+                # 在模拟中，我们可以选择跳过这个间隔或者认为传输失败
+                # 这里选择跳到下一个间隔开始处继续尝试
+                time_step = time_left_in_interval + 1e-9 # 跳过这个零容量间隔
+                total_transmission_time += time_step
+                current_time += time_step
+                continue # 继续下一个循环
+
+            # 在当前容量下，传完剩余数据需要多少时间
+            data_needed = size_to_transmit - transmitted_data
+            time_needed_at_current_capacity = data_needed / capacity
+
+            # 实际能在这个间隔中花费的时间，是剩余时间和所需时间中的较小者
+            time_spent_this_interval = min(time_left_in_interval, time_needed_at_current_capacity)
+
+            # 在这段时间内传输了多少数据
+            data_transmitted_this_step = capacity * time_spent_this_interval
+
+            # 更新状态
+            transmitted_data += data_transmitted_this_step
+            total_transmission_time += time_spent_this_interval
+            current_time += time_spent_this_interval
+
+            # 防止浮点数误差导致无法精确相等
+            if transmitted_data >= size_to_transmit - 1e-9:
+                break
+
+        if current_time >= max_simulation_time and transmitted_data < size_to_transmit:
+             return float('inf'), float('inf') # 表示传输失败或时间过长
+
+        completion_time = start_time + total_transmission_time
+
+        return total_transmission_time, completion_time
+    
 
     # --- MODIFIED: step 메서드는 기록을 업데이트해야 함 ---
     def step(self, action):
         k_i, speed_idx, x_i = action # x_i는 무시됨 (ALVS는 건너뛰기 수행 안 함)
-        chunk_idx = self.current_chunk_idx
+        current_playback_speed = self.playback_speeds[speed_idx]
+        chunk_idx = len(self.u_i)
         
-        if chunk_idx >= self.num_chunks: return self.reset(), 0.0, True, {}
+        if chunk_idx >= self.num_chunks: 
+            last_valid_idx = self.num_chunks - 1
+            if last_valid_idx < 0:
+                return self.reset(), 0.0, True, {}
+            current_state = self.get_state_for_decision(self.num_chunks)
+            return current_state, 0.0, True, {}
         
         # --- ALVS does not skip ---
         x_i = 0
-        
-        chunk_gen_time = self.generated_chunk_times.get(chunk_idx, (chunk_idx + 1) * self.t_i)
-        prev_comp_time = self.actual_completion_times.get(chunk_idx - 1, 0.0) if chunk_idx > 0 else 0.0
-        u_i = max(chunk_gen_time, prev_comp_time)
-        if self.u_i: u_i = max(u_i, self.u_i[-1] + 1e-9)
+
+        self.k_j.append(k_i)
+        self.speed_idx_j.append(speed_idx)
+        self.x_j.append(x_i)
+
+        # u_i (전송 시작 시간) 계산
+        chunk_generation_time = self.generated_chunk_times.get(chunk_idx, (chunk_idx + 1) * self.t_i)
+        prev_completion_time = 0.0
+        if chunk_idx > 0:
+            prev_idx = chunk_idx - 1
+            prev_action_info = self.chunk_actions.get(prev_idx)
+            if prev_action_info:
+                # no skip
+                prev_completion_time = self.actual_completion_times.get(prev_idx, 0.0)
+                if prev_completion_time == float('inf'):
+                    prev_completion_time = 0.0
+        else:
+            prev_completion_time = 0.0
+
+        u_i = max(chunk_generation_time, prev_completion_time)
+        if self.u_i: 
+            u_i = max(u_i, self.u_i[-1] + 1e-9)
         self.u_i.append(u_i)
         
-        self.k_j.append(k_i); self.speed_idx_j.append(speed_idx); self.x_j.append(x_i)
-        self.chunk_actions[chunk_idx] = {'k': k_i, 'speed': self.playback_speeds[speed_idx], 'x': x_i, 'u': u_i}
+        self.chunk_actions[chunk_idx] = {'k': k_i, 'speed_idx': speed_idx, 'speed': current_playback_speed, 'x': x_i, 'u': u_i}
         
-        l_i, comp_time = self._simulate_chunk_transmission(chunk_idx, k_i, u_i)
-        self.l_i.append(l_i); self.actual_completion_times[chunk_idx] = comp_time
+        # 전송 시뮬레이션
+        l_i, completion_time = self._simulate_chunk_transmission(chunk_idx, k_i, u_i)
+        if l_i != float('inf'):
+            if chunk_idx not in self.received_chunks:
+                self.received_chunks.append(chunk_idx)
+
+        # 전송 결과 저장
+        while len(self.l_i) <= chunk_idx:
+            self.l_i.append(0.0)
+        self.l_i[chunk_idx] = l_i
+        self.actual_completion_times[chunk_idx] = completion_time
         
         # --- 기록 업데이트 ---
         chunk_size_bits = self.bitrate_map[k_i] * 1_000_000 * self.t_i
@@ -152,23 +265,84 @@ class VideoStreamingEnvCombined:
         self.throughput_history.append(throughput)
         self.download_time_history.append(l_i)
         
-        # 재생 시점 및 끊김(Stall) 계산
-        prev_play_end_time = self.t_buffer
-        for j in range(chunk_idx - 1, -1, -1):
-            info = self.chunk_actions.get(j)
-            if info and info.get('x', 0) == 0 and j < len(self.p_i) and self.p_i[j] != float('inf'):
-                prev_play_end_time = self.p_i[j] + self.t_i / info.get('speed', 1.0); break
+        # 재생 시작 시점 (p_i) 및 Stall (d_i) 계산
+        p_i = float('inf') # default
+        d_i = 0.0 # default
 
-        p_i = max(comp_time, prev_play_end_time)
-        d_i = max(0, comp_time - prev_play_end_time)
+        if l_i != float('inf'):
+            ready_time = completion_time
+            prev_played_idx = -1
+            for j in range(chunk_idx - 1, -1, -1):
+                action_info = self.chunk_actions.get(j)
+                if action_info and j < len(self.p_i) and self.p_i[j] != float('inf'):
+                    prev_played_idx = j
+                    break
+            
+            if prev_played_idx != -1:
+                prev_action_info = self.chunk_actions[prev_played_idx]
+                prev_playback_speed = prev_action_info.get('speed', 1.0)
+                prev_play_duration = self.t_i / prev_playback_speed
+                prev_play_end_time = self.p_i[prev_played_idx] + prev_play_duration
+                p_i = max(ready_time, prev_play_end_time)
+                d_i = max(0, ready_time - prev_play_end_time)
+            else:
+                p_i = max(ready_time, self.t_buffer)
+                d_i = max(0, ready_time - self.t_buffer)
+        
+        else: # 전송 실패
+            p_i = float('inf')
+            d_i = float('inf')
         
         while len(self.p_i) <= chunk_idx: self.p_i.append(float('inf'))
         self.p_i[chunk_idx] = p_i
         while len(self.d_i) <= chunk_idx: self.d_i.append(0.0)
         self.d_i[chunk_idx] = d_i
         
+        # 성공적으로 재생됐을 경우, 전송 마지막 시간 기록
+        if p_i != float('inf'):
+            play_duration = self.t_i / current_playback_speed
+            self.chunk_play_end_times[chunk_idx] = p_i + play_duration
+
+        # 라이브 지연 (tau) 계산
+        tau_i = float('inf')
+        if chunk_idx == 0:
+            prev_tau = self.t_buffer
+        elif (chunk_idx - 1) < len(self.tau_i):
+            prev_tau = self.tau_i[chunk_idx - 1]
+        else:
+            prev_tau = self.t_buffer
+        
+        if p_i != float('inf'):
+            tau_i = p_i - chunk_idx * self.t_i
+        
+        # 라이브 지연 시간 저장
+        while len(self.tau_i) <= chunk_idx:
+            self.tau_i.append(float('inf'))
+        self.tau_i[chunk_idx] = tau_i
+
+        # 보상 계산을 위해, 다음 시점의 지연 (tau_i+1) 계산
+        tau_i_plus_1 = float('inf')
+        current_tau_i = self.tau_i[chunk_idx]
+        current_d_i = self.d_i[chunk_idx]
+
+        if current_tau_i != float('inf') and current_d_i != float('inf'):
+            time_saved_or_lost = self.t_i - (self.t_i / current_playback_speed)
+            tau_i_plus_1 = current_tau_i + max(0, current_d_i) - time_saved_or_lost
+        
         # 보상 계산
-        reward = self._get_reward(k_i, d_i, p_i - chunk_gen_time)
+        last_complete_d_i = 0.0
+        if chunk_idx > 0:
+             last_played_idx = -1
+             for j in range(chunk_idx - 1, -1, -1):
+                  action_info = self.chunk_actions.get(j)
+                  if action_info and action_info.get('x', 0) == 0 and j < len(self.p_i) and self.p_i[j] != float('inf'):
+                       last_played_idx = j
+                       break
+             if last_played_idx != -1 and last_played_idx < len(self.d_i):
+                  last_complete_d_i = self.d_i[last_played_idx]
+                  if last_complete_d_i == float('inf'): last_complete_d_i = 0.0
+
+        reward = self._get_reward(k_i, x_i, last_complete_d_i, tau_i_plus_1)
         
         # 이전 화질 선택 업데이트
         self.last_quality = k_i
@@ -198,26 +372,63 @@ class VideoStreamingEnvCombined:
         next_chunk_sizes_norm = np.array(next_chunk_sizes) / 1_000_000 # 정규화
 
         # 현재 시각 계산
-        chunk_gen_time = self.generated_chunk_times.get(target_chunk_idx, (target_chunk_idx + 1) * self.t_i)
-        prev_comp = self.actual_completion_times.get(target_chunk_idx - 1, 0.0)
-        calc_time_ui = max(chunk_gen_time, prev_comp) if target_chunk_idx > 0 else chunk_gen_time
-        if self.u_i: calc_time_ui = max(calc_time_ui, self.u_i[-1] + 1e-9)
-
-        # 4. 버퍼 크기
-        remaining_buffer = self.calculate_remaining_play_time(calc_time_ui, target_chunk_idx)
+        chunk_generation_time = self.generated_chunk_times.get(target_chunk_idx, (target_chunk_idx + 1) * self.t_i)
+        prev_completion = 0.0
+        if target_chunk_idx > 0:
+            prev_completion= self.actual_completion_times.get(target_chunk_idx - 1, 0.0)
+            if prev_completion == float('inf'):
+                prev_completion = self.u_i[-1] if self.u_i else 0.0
         
-        # 5. 라이브 지연 시간
-        current_tau = self._calculate_live_latency(calc_time_ui, target_chunk_idx)
+        u_i = max(chunk_generation_time, prev_completion)
+        if self.u_i:
+            u_i = max(u_i, self.u_i[-1] + 1e-9)
+        
+        # 라이브 지연 시간
+        n_i = -1
+        for j in range(target_chunk_idx - 1, -1, -1):
+            action_info = self.chunk_actions.get(j)
+            if action_info:
+                p_j = self.p_i[j]
+                if p_j != float('inf') and p_j <= u_i:
+                    n_i = j
+                    break
+        
+        tau_i = self.t_buffer
+        if n_i != -1:
+            p_n_i = self.p_i[n_i]
+            action_n = self.chunk_actions[n_i]
+            v_n = action_n['speed']
 
+            # n_i 이전까지의 실제 재생 지속 시간 합계 계산
+            sum_duration = 0.0
+            for j in range(n_i):
+                a_j = self.chunk_actions.get(j)
+                if a_j and a_j.get('x', 0) == 0:
+                    sum_duration += self.t_i / a_j['speed']
+            
+            # 현재 스톨 계산
+            play_end_time_n = p_n_i + (self.t_i / v_n)
+            current_stall = max(0.0, u_i - play_end_time_n)
+
+            tau_i = p_n_i - sum_duration + current_stall
+        else:
+            tau_i = self.t_buffer
+        
+        # 남은 버퍼 시간 계산
+        remaining_buffer_time = self.calculate_remaining_play_time(u_i, target_chunk_idx)
+    
         # 6. 현재 재생 비트레이트 (이전 선택 비트레이트 사용)
         last_bitrate = self.bitrate_map[self.last_quality]
 
         # 7. 남은 청크 수
         chunks_remaining = self.num_chunks - target_chunk_idx
         
+        safe_tau = tau_i if np.isfinite(tau_i) else 10.0
+        safe_buffer = remaining_buffer_time if np.isfinite(remaining_buffer_time) else 0.0
+        
         other_features = np.array([
-            remaining_buffer / 10.0, # 정규화
-            current_tau / 15.0, # 정규화
+            safe_buffer / 10.0, # 정규화
+            safe_tau / 10.0, # 정규화
             last_bitrate / 5.0, # 정규화
             chunks_remaining / self.num_chunks # 정규화
         ], dtype=np.float32)
@@ -230,34 +441,83 @@ class VideoStreamingEnvCombined:
         }
 
     # --- MODIFIED: ALVS Eq. (8)에 맞춰 보상 함수 재작성 ---
-    def _get_reward(self, k_i, d_i, live_latency_i):
-        # r_t = c0*VQ_t - c1*stall - c2*|VQ_t - VQ_{t-1}| - c3*latency
-        current_bitrate = self.bitrate_map[k_i]
-        last_bitrate = self.bitrate_map[self.last_quality]
-        
-        quality_reward = self.W1 * current_bitrate
-        stall_penalty = self.W2 * d_i
-        latency_penalty = self.W3 * live_latency_i
-        smoothness_penalty = self.W4 * abs(current_bitrate - last_bitrate)
-        
-        return quality_reward - stall_penalty - latency_penalty - smoothness_penalty
+    def _get_reward(self, k_i, x_i, last_complete_d_i, tau_i_plus_1):
+        """计算奖励"""
+        quality_reward = 0
+        if x_i == 0:
+            
+            quality_reward = self.W1 * (k_i**2) 
 
-    # get_... 보조 함수 수정 불필요
-    def get_average_quality(self):
-        played_q = [self.bitrate_map[k] for i,k in enumerate(self.k_j) if self.x_j[i]==0 and i < len(self.p_i) and self.p_i[i]!=float('inf')]
-        return np.mean(played_q) if played_q else 0
-    def get_total_stall_time(self): return sum(d for d in self.d_i if np.isfinite(d))
-    def get_skip_statistics(self): return sum(self.x_j), len(self.x_j) - sum(self.x_j)
-    def get_average_speed(self):
-        speeds = [self.playback_speeds[s] for i,s in enumerate(self.speed_idx_j) if self.x_j[i]==0]
+        # 卡顿惩罚 (基于上一个播放块的卡顿)
+        stall_penalty = self.W2 * last_complete_d_i
+
         
-        return np.mean(speeds) if speeds else 1.0
+        delay_penalty = self.W_tau * (tau_i_plus_1 - self.t_i*x_i) ** 2
+
+        # 跳过惩罚
+        skip_penalty = self.W3 * x_i
+
+        raw_reward = quality_reward  - delay_penalty - skip_penalty - stall_penalty
+        reward = max(min(raw_reward, 20), -20)
+
+        
+
+        return reward
+
+    # --- Add back get_skip_statistics ---
+    def get_skip_statistics(self):
+        if not self.x_j: return 0, 0
+        skipped = sum(self.x_j)
+        num_processed = len(self.x_j)
+        played = num_processed - skipped
+        return skipped, played
+
+    def get_average_speed(self):
+        if not self.speed_idx_j: return 1.0 # Default if no actions taken
+        actual_speeds = [self.playback_speeds[idx] for idx in self.speed_idx_j]
+        return sum(actual_speeds) / len(actual_speeds)
+    # get_average_quality needs to check x_j
+    def get_average_quality(self):
+        # Quality of chunks that were chosen *and not skipped* and successfully started playing
+        played_qualities = [self.k_j[i] for i in range(len(self.k_j))
+                            if i < len(self.x_j) and self.x_j[i] == 0 # Not skipped
+                            and i < len(self.p_i) and self.p_i[i] != float('inf')] # Played successfully
+        if not played_qualities: return 0
+        return sum(played_qualities) / len(played_qualities)
+
+    def get_average_capacity(self):
+        if not self.interval_capacities: return 0
+        valid_capacities = [c for c in self.interval_capacities.values() if c is not None and c != float('inf')]
+        if not valid_capacities: return 0
+        avg_bytes_per_sec = sum(valid_capacities) / len(valid_capacities)
+        return (avg_bytes_per_sec * 8) / 1e6
+        
+    def get_average_tau_i(self):
+        """返回当前episode所有记录的tau_i的平均值 (忽略inf)"""
+        if not self.tau_i: return 0.0
+        valid_tau = [t for t in self.tau_i if t is not None and t != float('inf')]
+        if not valid_tau: return 0.0 # 如果全是 inf 或空
+        avg = sum(valid_tau) / len(valid_tau)
+        return avg
+
+    def get_total_stall_time(self):
+        """返回当前episode的总卡顿时间 (忽略inf)"""
+        if not self.d_i: return 0.0
+        actual_stalls = [d for d in self.d_i if d is not None and d != float('inf') and d > 1e-9]
+        total = sum(actual_stalls)
+        return total
+
+    def get_average_d_i(self):
+        if not self.d_i: return 0.0
+        valid_d_values = [d for d in self.d_i if isinstance(d, (int, float)) and d != float('inf')]
+        if not valid_d_values: return 0.0
+        return sum(valid_d_values) / len(valid_d_values)
 
 # --- 강화 학습 부분 (A3C 알고리즘 - ALVS 버전) ---
 
 # --- NEW: 새로운 상태 차원 및 초매개변수 정의 ---
 HISTORY_LEN = 8
-QUALITY_LEVELS = 4 # 환경 설정과 일치
+QUALITY_LEVELS = 20 # 환경 설정과 일치
 SPEED_LEVELS = 3
 # State is a dictionary now, so STATE_DIM is not a single number
 
@@ -280,38 +540,41 @@ class ActorNetwork_ALVS(nn.Module):
         # CNN output shape: (batch, 128, 5) -> flatten -> (batch, 128*5=640)
         # Other features: 4 (buffer, latency, quality, remaining)
         self.mlp = nn.Sequential(
-            nn.Linear(640 + 4, 128),
+            nn.Linear(2176 + 4, 128),
             nn.ReLU()
         )
         self.quality_head = nn.Linear(128, QUALITY_LEVELS)
         self.speed_head = nn.Linear(128, SPEED_LEVELS)
 
     def forward(self, state_dict):
-        # CNN 입력 준비
-        # shape: (batch, history_len) -> (batch, 1, history_len)
+        # 1. 히스토리 데이터 (길이 8) -> (Batch, 1, 8)
         throughput = state_dict['throughput_history'].unsqueeze(1)
         download_time = state_dict['download_time_history'].unsqueeze(1)
         
-        # next_chunk_sizes를 기록 데이터 길이와 동일하게 확장
-        # shape: (batch, num_qualities) -> (batch, 1, num_qualities)
-        chunk_sizes_unsqueezed = state_dict['next_chunk_sizes'].unsqueeze(1)
-        # Pad to history_len
-        padding_size = HISTORY_LEN - chunk_sizes_unsqueezed.size(2)
-        chunk_sizes = nn.functional.pad(chunk_sizes_unsqueezed, (0, padding_size))
-
-        # CNN 입력으로 병합: (batch, 3, history_len)
-        cnn_input = torch.cat([throughput, download_time, chunk_sizes], dim=1)
+        # 2. 다음 청크 크기 데이터 (길이 20) -> (Batch, 1, 20)
+        chunk_sizes = state_dict['next_chunk_sizes'].unsqueeze(1)
         
-        cnn_output = self.cnn(cnn_input)
-        cnn_output_flat = cnn_output.view(cnn_output.size(0), -1)
+        # 3. 히스토리 데이터를 길이 20으로 패딩 (앞부분은 유지, 뒷부분 0 채움)
+        # target_len(20) - current_len(8) = 12만큼 패딩
+        target_len = chunk_sizes.size(2) # 20
+        current_len = throughput.size(2) # 8
+        padding = target_len - current_len # 12
         
-        # MLP 입력 준비
+        # (Batch, 1, 8) -> (Batch, 1, 20)
+        throughput_padded = nn.functional.pad(throughput, (0, padding))
+        download_time_padded = nn.functional.pad(download_time, (0, padding))
+        
+        # 4. CNN 입력 병합: (Batch, 3, 20)
+        cnn_input = torch.cat([throughput_padded, download_time_padded, chunk_sizes], dim=1)
+        
+        # 5. CNN 통과
+        cnn_output = self.cnn(cnn_input) # Output shape: (Batch, 128, 17)
+        cnn_output_flat = cnn_output.view(cnn_output.size(0), -1) # Flatten
+        
+        # 6. MLP 입력 병합
         other_features = state_dict['other_features']
-        
-        # CNN 출력과 기타 특징 병합
         combined_features = torch.cat([cnn_output_flat, other_features], dim=1)
         
-        # MLP 및 출력 헤드 통과
         base = self.mlp(combined_features)
         return self.quality_head(base), self.speed_head(base)
 
@@ -324,22 +587,29 @@ class CriticNetwork(nn.Module):
             nn.ReLU()
         )
         self.mlp = nn.Sequential(
-            nn.Linear(640 + 4, 128),
+            nn.Linear(2176 + 4, 128),
             nn.ReLU(),
             nn.Linear(128, 1) # 가치 값 출력
         )
 
     def forward(self, state_dict):
-        # Actor의 특징 추출 로직 재사용
+        # Actor와 동일한 전처리 과정
         throughput = state_dict['throughput_history'].unsqueeze(1)
         download_time = state_dict['download_time_history'].unsqueeze(1)
-        chunk_sizes_unsqueezed = state_dict['next_chunk_sizes'].unsqueeze(1)
-        padding_size = HISTORY_LEN - chunk_sizes_unsqueezed.size(2)
-        chunk_sizes = nn.functional.pad(chunk_sizes_unsqueezed, (0, padding_size))
-
-        cnn_input = torch.cat([throughput, download_time, chunk_sizes], dim=1)
+        chunk_sizes = state_dict['next_chunk_sizes'].unsqueeze(1)
+        
+        target_len = chunk_sizes.size(2) # 20
+        current_len = throughput.size(2) # 8
+        padding = target_len - current_len # 12
+        
+        throughput_padded = nn.functional.pad(throughput, (0, padding))
+        download_time_padded = nn.functional.pad(download_time, (0, padding))
+        
+        cnn_input = torch.cat([throughput_padded, download_time_padded, chunk_sizes], dim=1)
+        
         cnn_output = self.cnn(cnn_input)
         cnn_output_flat = cnn_output.view(cnn_output.size(0), -1)
+        
         other_features = state_dict['other_features']
         combined_features = torch.cat([cnn_output_flat, other_features], dim=1)
         
@@ -353,7 +623,7 @@ class Worker(mp.Process):
         self.optimizer_lock = optimizer_lock
         
         # --- MODIFIED: 환경 초기화 시 ALVS 보상 가중치 전달 ---
-        self.env = VideoStreamingEnvCombined(W1=1.0, W2=1.5, W3=0.02, W4=0.005)
+        self.env = VideoStreamingEnv_ALVS(W1=1.0, W2=30, W3=100, W_tau=0.5)
         self.l_actor, self.l_critic = ActorNetwork_ALVS(), CriticNetwork()
 
     def run(self):
@@ -374,7 +644,7 @@ class Worker(mp.Process):
 
                 for t in range(self.env.num_chunks):
                     # 기록을 위해 상태 사전에서 지연 시간 추출
-                    ep_taus.append(state['other_features'][1] * 15.0) # 역정규화
+                    ep_taus.append(state['other_features'][1] * 10.0) # 역정규화
                     
                     # 상태 사전을 Tensor 사전으로 변환
                     state_tensor_dict = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in state.items()}
@@ -519,7 +789,7 @@ def logger(logging_queue, g_actor, g_critic, total_workers):
 def test(actor_model_path):
     print(f"\n--- Starting Evaluation for model: {actor_model_path} ---")
     N_TEST_EPISODES = 100
-    env = VideoStreamingEnvCombined(W1=1.0, W2=1.5, W3=0.02, W4=0.005)
+    env = VideoStreamingEnv_ALVS(W1=1.0, W2=1.5, W3=0.02, W_tau=0.005)
     actor = ActorNetwork_ALVS().to(device)
     
     try:
@@ -538,7 +808,7 @@ def test(actor_model_path):
         done = False
 
         while not done:
-            ep_taus.append(state['other_features'][1] * 15.0) # 역정규화
+            ep_taus.append(state['other_features'][1] * 10.0) # 역정규화
             # --- MODIFIED: 사전 입력 준비 ---
             state_tensor_dict = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in state.items()}
 
