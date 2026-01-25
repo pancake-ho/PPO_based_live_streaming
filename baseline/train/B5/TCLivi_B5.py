@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -10,6 +11,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+proposed_dir = os.path.join(current_dir, '../proposed')
+sys.path.append(proposed_dir)
 
 try:
     from proposed import DynamicChannelModel
@@ -76,7 +81,7 @@ class VideoStreamingEnv_TCLiVi:
     def reset(self):
         self.interval_capacities, self.actual_completion_times, self.chunk_actions = {}, {}, {}
         self.generated_chunk_times = {i: (i + 1) * self.t_i for i in range(self.num_chunks)}
-        self.u_i, self.p_i, self.d_i, self.k_j, self.l_i, self.speed_j = [], [], [], [], [], []
+        self.u_i, self.p_i, self.d_i, self.k_j, self.l_i, self.speed_j, self.tau_i, self.x_j = [], [], [], [], [], [], [], []
         self.chunk_history.clear()
         for _ in range(self.history_len):
             self.chunk_history.append(np.zeros(self.num_history_features, dtype=np.float32))
@@ -409,9 +414,10 @@ class VideoStreamingEnv_TCLiVi:
         return skipped, played
 
     def get_average_speed(self):
-        if not self.speed_idx_j: return 1.0 # Default if no actions taken
-        actual_speeds = [self.playback_speeds[idx] for idx in self.speed_idx_j]
-        return sum(actual_speeds) / len(actual_speeds)
+        # speed_j에 이미 실제 속도 값(예: 1.0, 1.1 등)이 들어있으므로 바로 평균을 구하면 됩니다.
+        if not self.speed_j: return 1.0
+        return sum(self.speed_j) / len(self.speed_j)
+    
     # get_average_quality needs to check x_j
     def get_average_quality(self):
         # Quality of chunks that were chosen *and not skipped* and successfully started playing
@@ -453,15 +459,15 @@ class VideoStreamingEnv_TCLiVi:
 #################################
 # PPO 알고리즘 부분 - 수정 불필요
 #################################
-LEARNING_RATE = 1e-4,
-GAMMA = 0.96,
-LAMBDA = 0.97,
-BATCH_SIZE = 128,
-EPOCHS = 10,
-CLIP_EPSILON = 0.2,
-NUM_STEPS = 1024,
-MAX_EPISODES = 50000,
-ENTROPY_COEF = 0.01,
+LEARNING_RATE = 1e-4
+GAMMA = 0.96
+LAMBDA = 0.97
+BATCH_SIZE = 128
+EPOCHS = 10
+CLIP_EPSILON = 0.2
+NUM_STEPS = 1024
+MAX_EPISODES = 50000
+ENTROPY_COEF = 0.01
 HISTORY_LEN, NUM_FEATURES, ACTION_DIM = 48, 6, 40
 
 class ActorNetworkTCLiVi(nn.Module):
