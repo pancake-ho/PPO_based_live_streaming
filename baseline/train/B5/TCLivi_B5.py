@@ -260,6 +260,8 @@ class VideoStreamingEnv_TCLiVi:
 
         self.speed_j.append(current_playback_speed)
         self.k_j.append(k_i)
+        
+        self.x_j.append(x_i)
 
         # 실행 (전송 시뮬레이션 및 스킵)
         l_i = 0.0
