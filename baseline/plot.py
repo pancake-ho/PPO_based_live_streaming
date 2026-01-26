@@ -58,29 +58,7 @@ def get_bitrate_mbps(env, k: int, default: float=0.8) -> float:
             if str_k in bit_map:
                 return float(bit_map[str_k])
     
-    # DASH env 가 group_bitrate_mbps 제공하는 경우 (DASH)
-    if hasattr(env, "group_bitrates_mbps"):
-        group_bit = getattr(env, "group_bitrates_mbps")
-
-        if isinstance(group_bit, dict):
-            vals = None
-            if k in group_bit:
-                vals = group_bit[k]
-            
-            else:
-                str_k = str(k)
-                if str_k in group_bit:
-                    vals = group_bit[str_k]
-            
-            if vals is not None:
-                if isinstance(vals, (list, tuple, np.ndarray)):
-                    return float(np.mean(vals)) if len(vals) > 0 else float(default)
-                return float(vals)
-    
     return float(default)
-
-
-
 
 
 @dataclass(frozen=True)
@@ -215,16 +193,10 @@ class B1_BufferBasedABR:
         return (k, speed_idx, x)
 
 
-
-
 class Test_PPOAgent:
     """
-    Generic PPO actor policy wrapper:
-      - loads actor weights from:
-          * .pt containing {"actor": state_dict, "critic": ...}  OR
-          * .pth state_dict directly (actor-only)
-      - supports fixing speed/skip heads (for B2/B4) or enabling them (B5/B6/Proposed)
-      - optional rule skip (B4)
+    DASH Dataset 에 맞춰, Proposed & B2, B3 에 대해
+    Inference 를 진행하는 PPO Agent
     """
     def __init__(
         self,
@@ -253,7 +225,7 @@ class Test_PPOAgent:
         self.greedy = greedy
 
 
-    def _load_model(self, path: str):
+    def _load_model(self):
         model_name_base = f'Combined_ppo_episode_{self.model_episode}'
         actor_filename = f'{model_name_base}_actor.pth'
         actor_path = os.path.join(self.model_dir, actor_filename)
@@ -281,7 +253,7 @@ class Test_PPOAgent:
         pass
 
     @torch.no_grad()
-    def select_action(self, state: np.ndarray, env) -> Tuple[int, int, int]:
+    def select_action(self, state: np.ndarray) -> Tuple[int, int, int]:
         state_tensor = torch.FloatTensor(state).to(self.device)
         if state_tensor.dim() == 1:
             state_tensor = state_tensor.unsqueeze(0)
@@ -306,7 +278,6 @@ class Test_PPOAgent:
             skip_action_idx = int(self.fixed_skip) # a_x
 
         quality_level = quality_action_idx + 1
-
         return (quality_level, speed_action_idx, skip_action_idx)
 
 class ALVS_PolicyWrapper:

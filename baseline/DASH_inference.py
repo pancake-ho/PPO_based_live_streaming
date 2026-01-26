@@ -101,6 +101,7 @@ class VideoStreamingEnvCombined:
                 reps_for_first.items(),
                 key=lambda x: x[1].bitrate_kbps
             )
+            
             rep_indices_sorted = [rep_idx for rep_idx, info in sorted_reps]
 
             # 20개 rep 를 4묶음으로 나눔
