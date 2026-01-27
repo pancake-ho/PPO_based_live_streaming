@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from baseline.train.B4.ALVS_B4 import ActorNetwork_ALVS
@@ -300,6 +301,57 @@ class Test_PPOAgent:
         return (quality_level, speed_action_idx, skip_action_idx)
 
 
+class ActorNetwork_ALVS(nn.Module):
+    def __init__(self):
+        super(ActorNetwork_ALVS, self).__init__()
+        # CNN for throughput, download time, and chunk sizes
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels=3, out_channels=128, kernel_size=4),
+            nn.ReLU()
+        )
+        # Flattened CNN output will be concatenated with other features
+        # CNN output shape: (batch, 128, 5) -> flatten -> (batch, 128*5=640)
+        # Other features: 4 (buffer, latency, quality, remaining)
+        self.mlp = nn.Sequential(
+            nn.Linear(2176 + 4, 128),
+            nn.ReLU()
+        )
+        self.quality_head = nn.Linear(128, 20)
+        self.speed_head = nn.Linear(128, 3)
+
+    def forward(self, state_dict):
+        # 1. 히스토리 데이터 (길이 8) -> (Batch, 1, 8)
+        throughput = state_dict['throughput_history'].unsqueeze(1)
+        download_time = state_dict['download_time_history'].unsqueeze(1)
+        
+        # 2. 다음 청크 크기 데이터 (길이 20) -> (Batch, 1, 20)
+        chunk_sizes = state_dict['next_chunk_sizes'].unsqueeze(1)
+        
+        # 3. 히스토리 데이터를 길이 20으로 패딩 (앞부분은 유지, 뒷부분 0 채움)
+        # target_len(20) - current_len(8) = 12만큼 패딩
+        target_len = chunk_sizes.size(2) # 20
+        current_len = throughput.size(2) # 8
+        padding = target_len - current_len # 12
+        
+        # (Batch, 1, 8) -> (Batch, 1, 20)
+        throughput_padded = nn.functional.pad(throughput, (0, padding))
+        download_time_padded = nn.functional.pad(download_time, (0, padding))
+        
+        # 4. CNN 입력 병합: (Batch, 3, 20)
+        cnn_input = torch.cat([throughput_padded, download_time_padded, chunk_sizes], dim=1)
+        
+        # 5. CNN 통과
+        cnn_output = self.cnn(cnn_input) # Output shape: (Batch, 128, 17)
+        cnn_output_flat = cnn_output.view(cnn_output.size(0), -1) # Flatten
+        
+        # 6. MLP 입력 병합
+        other_features = state_dict['other_features']
+        combined_features = torch.cat([cnn_output_flat, other_features], dim=1)
+        
+        base = self.mlp(combined_features)
+        return self.quality_head(base), self.speed_head(base)
+
+
 class ALVS_PolicyWrapper:
     """
     [수정됨] B4 (ALVS) 의 로직을 완벽하게 반영한 Wrapper
@@ -479,6 +531,20 @@ class ALVS_PolicyWrapper:
         
         return (env_k, s_action, 0)
 
+class ActorNetworkTCLiVi(nn.Module):
+    def __init__(self):
+        super(ActorNetworkTCLiVi, self).__init__() 
+        self.conv1 = nn.Conv1d(6, 32, 3)
+        self.flatten_size = 32 * (48 - 3 + 1)
+        self.fc1 = nn.Linear(self.flatten_size, 128)
+        self.fc2 = nn.Linear(128, 40)
+        
+    def forward(self, state):
+        x = torch.relu(self.conv1(state.permute(0, 2, 1))).view(-1, self.flatten_size)
+        x = torch.relu(self.fc1(x)); return torch.softmax(self.fc2(x), dim=-1)
+
+
+
 class TCLivi_PolicyWrapper:
     """
     [수정됨] B5 (TCLiVi) 의 학습 로직(20 Qualities, 2 Target Buffers)을 
@@ -642,10 +708,15 @@ class TCLivi_PolicyWrapper:
         env_k = self._map_b5_action_to_env(b5_k, env)
 
         return (env_k, speed_idx, 0)
+
+
 # ----------------------------
 # Env creation + evaluation
 # ----------------------------
 def write_rows_csv(out_csv: str, rows: list[dict]):
+    """
+    각 데이터 당 그래프를 그리기 위한 csv 파일을 만드는 함수
+    """
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
     cols = ["sweep", "x", "dataset", "method",
             "avg_quality", "skip_rate", "total_stall", "live_latency", "episode_return", "avg_speed"]
@@ -917,11 +988,10 @@ def main():
 
     env_module = load_module_from_path(args.env_path, module_name="env_module")
 
-    baseline_dir = Path(args.baseline_dir)
-    b2_path = baseline_dir / "b2/b2_25000_actor.pth"
-    b3_path = baseline_dir / "b3/b3_50000_actor.pth"
-    b4_path = baseline_dir / "b4/ALVS_A3C_actor_ep15000.pth"
-    b5_path = baseline_dir / "b5/TCLiVi_rule_based_speed_actor_ep50000.pth"
+    b2_path = "./baseline/train/proposed/baseline_models/b2/b2_25000_actor.pth"
+    b3_path = "./baseline/train/proposed/baseline_models/b3/b3_50000_actor.pth"
+    b4_path = "./baseline/train/B4/models/ALVS_A3C_actor_ep15000.pth"
+    b5_path = "./baseline/train/B5/models/TCLiVi_rule_based_speed_actor_ep50000.pth"
 
     # Proposed checkpoint auto-find unless user specifies
     proposed_ckpt = args.dash_ckpt.strip() or args.dash_actor.strip() or auto_find_proposed_ckpt(episode=50000)
@@ -954,17 +1024,15 @@ def main():
         "Proposed(DASH)": proposed_policy,
         "B1": None,  # buffer-dependent (created per point)
     }
-    tmp_env = env_module.VideoStreamingEnvCombined()
-    fixed_speed_idx = int(tmp_env.playback_speeds.index(1.0))
 
     # PPO baselines from baseline_models
     if b2_path.exists():
-        policies["B2"] = Test_PPOAgent(env_module, actor_ckpt=str(b2_path), learn_speed=False, learn_skip=False, fixed_speed_idx=fixed_speed_idx, fixed_skip=0, greedy=True)
+        policies["B2"] = Test_PPOAgent(env_module, actor_ckpt=str(b2_path), learn_speed=False, learn_skip=False, fixed_speed_idx=1, fixed_skip=0, greedy=True)
     else:
         print(f"[WARN] missing: {b2_path}")
     
     if b3_path.exists():
-        policies["B3"] = Test_PPOAgent(env_module, actor_ckpt=str(b3_path), learn_speed=False, learn_skip=True, fixed_speed_idx=fixed_speed_idx, greedy=True)
+        policies["B3"] = Test_PPOAgent(env_module, actor_ckpt=str(b3_path), learn_speed=False, learn_skip=True, fixed_speed_idx=1, greedy=True)
     else:
         print(f"[WARN] missing: {b3_path}")
 
@@ -974,7 +1042,7 @@ def main():
         print(f"[WARN] missing: {b4_path}")
 
     if b5_path.exists(): # TCLivi
-        policies["B5"] = TCLivi_PolicyWrapper(str(b5_path), greedy=True, history_len=48)
+        policies["B5"] = TCLivi_PolicyWrapper(str(b5_path), greedy=True)
     else:
         print(f"[WARN] missing: {b5_path}")
 
