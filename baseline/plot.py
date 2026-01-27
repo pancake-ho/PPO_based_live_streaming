@@ -38,25 +38,24 @@ import matplotlib.pyplot as plt
 from baseline.train.B4.ALVS_B4 import ActorNetwork_ALVS
 from baseline.train.B5.TCLivi_B5 import ActorNetworkTCLiVi
 
-# ----------------------------
-# Utils: dynamic import
-# ----------------------------
+# 유틸
 
 def get_bitrate_mbps(env, k: int, default: float=0.8) -> float:
     """
-    non-DASH: env.bitrate_map[k]
-    DASH: env.group_bitrate_mbps[k]
+    env.bitrate_mbps 를 우선적으로 사용하여 비트레이트(Mbps 단위) 반환하는 함수
+    현재는 multi_dash_env.py 에서 bitrate 를 가져옴
     """
-    # 기존 env 가 bitrate_map 제공하는 경우 (non-DASH)
-    if hasattr(env, "bitrate_map"):
+    # env.bitrate_map 이 존재하는 지 사전적으로 확인
+    if hasattr(env, "bitrate_map") and isinstance(env.bitrate_map, dict):
         bit_map = getattr(env, "bitrate_map")
 
-        if isinstance(bit_map, dict):
-            if k in bit_map:
-                return float(bit_map[k])
-            str_k = str(k)
-            if str_k in bit_map:
-                return float(bit_map[str_k])
+        if k in bit_map:
+            return float(bit_map[k])
+        
+        # key 가 문자열일 경우 대비
+        str_k = str(k)
+        if str_k in bit_map:
+            return float(bit_map[str_k])
     
     return float(default)
 
@@ -86,37 +85,52 @@ def parse_datasets_arg(s: str) -> list[DatasetSpec]:
 
 def make_env(env_module, ds: DatasetSpec, t_buffer: float, snr_db: float | None):
     """
-    DASH 데이터에 따라, Env 를 다르게 설정함
+    DASH 데이터셋을 로드하고, 환경을 구성하는 함수
     """
+    # 데이터셋 로드
     dataset = None
-    
-    if ds.kind.lower() in ("non-dash", "none"):
-        dataset = None
-    elif ds.kind.lower() in ("bbb", "bigbuckbunny"): # 더 추가 가능
-        dataset = env_module.BigBuckBunnyDataset(ds.csv_path)
-    elif ds.kind.lower() in ("swiss", "swiss_account"):
-        dataset = env_module.Swiss_Dataset(ds.csv_path)
-    elif ds.kind.lower() in ("elephants"):
-        dataset = env_module.Elephants_Dataset(ds.csv_path)
-
-    # Forest_men 데이터는 SD 데이터로, 
-    elif ds.kind.lower() in ("forest_men", "Forest_men"):
-        dataset = env_module.Forest_men_Dataset(ds.csv_path)
-    else:
-        raise RuntimeError(f"존재하지 않는 데이터셋입니다. 이름을 확인하세요: {ds.kind}")
-    
-    # snr_db 가 None 이면 기본값 35 사용
+    if ds.kind.lower() not in ("non-dash", "none"):
+        if ds.kind.lower() in ("bbb", "bigbuckbunny"): # 더 추가 가능
+            dataset = env_module.BigBuckBunnyDataset(ds.csv_path)
+        elif ds.kind.lower() in ("swiss", "swiss_account"):
+            dataset = env_module.Swiss_Dataset(ds.csv_path)
+        elif ds.kind.lower() in ("elephants"):
+            dataset = env_module.Elephants_Dataset(ds.csv_path)
+        elif ds.kind.lower() in ("forest_men", "Forest_men"):
+            dataset = env_module.Forest_men_Dataset(ds.csv_path)
+        else:
+            raise RuntimeError(f"존재하지 않는 데이터셋입니다. 이름을 확인하세요: {ds.kind}")
+        
+    # SNR 설정
     target_snr = float(snr_db) if snr_db is not None else 35.0
     
-    env = env_module.VideoStreamingEnvCombined(
+    # env 생성
+    if hasattr(env_module, "Multi_dash_VideoStreamingEnv"):
+        envclass = env_module.Multi_dash_VideoStreamingEnv
+    else:
+        envclass = env_module.VideoStreamingEnvCombined
+
+    env = envclass(
         t_buffer = float(t_buffer),
         verbose=False,
         dash_dataset=dataset,
-        snr_db=target_snr
     )
-    if snr_db is not None:
+
+    # Channel Model 업데이트 (SNR 적용)
+    if hasattr(env, "channel_model"):
         env.channel_model.gamma = 10 ** (target_snr / 10.0)
-        
+
+    # 다양한 DASH 데이터에따라 유동적으로 비트레이트 조절하는 지 검증
+    if dataset is not None and (not hasattr(env, "bitrate_map") or not env.bitrate_map):
+        print("[WARN] Env에 bitrate_map이 생성되지 않았습니다. 수동으로 생성합니다.")
+        env.bitrate_map = {}
+        first_chunk_idx = 1
+        if hasattr(dataset, "chunk_table") and first_chunk_idx in dataset.chunk_table:
+            reps = dataset.chunk_table[first_chunk_idx]
+            # bitrate 기준 정렬
+            sorted_reps = sorted(reps.items(), key=lambda x: x[1].bitrate_kbps)
+            for rep_idx, info in sorted_reps:
+                env.bitrate_map[rep_idx] = info.bitrate_kbps / 1000.0
     return env
 
 
@@ -211,7 +225,12 @@ class Test_PPOAgent:
     ):
         self.env_module = env_module
         self.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-        self.actor = env_module.ActorNetworkCombined().to(self.device)
+
+        if hasattr(env_module, "ActorNetworkCombined"):
+            self.actor = env_module.ActorNetworkCombined().to(self.device)
+        else:
+            raise RuntimeError("env_module 내에 ActorNetworkCombined 클래스가 정의되어 있지 않습니다.")
+        
         self.model_episode = model_episode_to_load
         self.model_dir = model_dir
 
@@ -280,100 +299,116 @@ class Test_PPOAgent:
         quality_level = quality_action_idx + 1
         return (quality_level, speed_action_idx, skip_action_idx)
 
+
 class ALVS_PolicyWrapper:
     """
-    B4 의 ActorNetwork_ALVS 를 사용하되,
-    env_module 의 실행 정보로 ALVS 입력을 구성해서 Action 반환하게 하는 클래스
+    [수정됨] B4 (ALVS) 의 로직을 완벽하게 반영한 Wrapper
+    - 학습 코드(ALVS_B4.py)의 20-level Bitrate Map을 사용하여 입력 차원 고정
+    - Latency 정규화 상수 수정 (15.0 -> 10.0)
+    - Action Mapping: 20-level 출력을 현재 Env의 레벨로 근사 매핑
     """
     def __init__(self, ckpt_path: str, device: Optional[str]=None, greedy: bool=True):
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.greedy = greedy
-        self.network = ActorNetwork_ALVS().to(self.device)
-        self.network.eval()
+        
+        # ALVS_B4.py에 정의된 네트워크 구조를 가져와야 함
+        # (plot.py 상단에서 이미 import 되었다고 가정)
+        self.actor = ActorNetwork_ALVS().to(self.device)
+        self._load_ckpt(ckpt_path)
+
+        self.actor.eval()
         self.history_len = 8
 
         # history 버퍼
         self.throughput_hist = deque([0.0] * self.history_len, maxlen=self.history_len)
         self.dl_time_hist = deque([0.0] * self.history_len, maxlen=self.history_len)
+        
+        # 초기화: ALVS 학습 코드 기준 초기 화질 (Index 0 -> Level 1)
+        self.last_quality_idx_alvs = 0 
 
-        self.last_quality = 1
+        # --- [중요] ALVS_B4.py 학습에 사용된 20-level Bitrate Map ---
+        self.alvs_bitrate_map = {
+            1: 0.045,   2: 0.089,   3: 0.131,   4: 0.178,   5: 0.221,
+            6: 0.262,   7: 0.334,   8: 0.396,   9: 0.522,   10: 0.595,
+            11: 0.791,  12: 1.032,  13: 1.244,  14: 1.546,  15: 2.133,
+            16: 2.484,  17: 3.078,  18: 3.526,  19: 3.840,  20: 4.219
+        }
+        self.alvs_quality_levels = sorted(list(self.alvs_bitrate_map.keys())) # 1~20
 
-        self._load_ckpt(ckpt_path)
-    
     def _load_ckpt(self, path: str):
         ckpt = torch.load(str(Path(path).resolve()), map_location="cpu")
-        
         if isinstance(ckpt, dict) and "actor" in ckpt:
-            self.network.load_state_dict(ckpt["actor"])
-        
+            self.actor.load_state_dict(ckpt["actor"])
         elif isinstance(ckpt, dict):
-            self.network.load_state_dict(ckpt)
-        
+            self.actor.load_state_dict(ckpt)
         else:
-            raise RuntimeError(f"[ALVS-B4] Path 주소를 확인해주세요: {path}")
-        self.network.to(self.device)
-        self.network.eval()
-    
+            self.actor.load_state_dict(ckpt) # 직접 저장된 경우
+
     def reset(self):
-        # history 버퍼
+        # history 버퍼 초기화
         self.throughput_hist = deque([0.0] * self.history_len, maxlen=self.history_len)
         self.dl_time_hist = deque([0.0] * self.history_len, maxlen=self.history_len)
-        
-        self.last_quality = 1
+        self.last_quality_idx_alvs = 0
 
     def _update_hist_from_env(self, env):
+        """
+        Env의 실행 결과를 바탕으로 History 업데이트
+        """
+        # Env에서 마지막 다운로드 시간 및 화질 가져오기
         l_i = float(env.l_i[-1]) if hasattr(env, "l_i") and len(env.l_i) > 0 else 0.0
-        k = int(env.k_j[-1]) if hasattr(env, "k_j") and len(env.k_j) > 0 else self.last_quality
-
-        self.last_quality = k
-
-        if hasattr(env, "bitrate_map") and hasattr(env, "t_i"):
-            chunk_bits = get_bitrate_mbps(env, k) * 1_000_000.0 * float(env.t_i)
-        else:
-            chunk_bits = 0.0
         
-        # throughput = bits / secs
+        # 현재 Env에서 선택된 화질의 Bitrate 계산
+        # (주의: Env의 화질 인덱스가 ALVS의 20단계와 다르더라도 실제 전송된 비트레이트를 기준으로 계산해야 함)
+        k_env_idx = int(env.k_j[-1]) if hasattr(env, "k_j") and len(env.k_j) > 0 else 0
+        
+        # Env의 Bitrate 가져오기
+        real_bitrate_mbps = get_bitrate_mbps(env, k_env_idx, default=0.5) # plot.py의 유틸 함수 사용
+        t_i = float(getattr(env, "t_i", 2.0))
+        
+        chunk_bits = real_bitrate_mbps * 1_000_000.0 * t_i
+        
+        # Throughput (bps)
         thr = chunk_bits / max(l_i, 1e-9)
+        
         self.throughput_hist.append(thr)
         self.dl_time_hist.append(l_i)
 
     def _build_state_dict(self, state: np.ndarray, env):
         """
-        ALVS_B4 내 forward 함수가 기대하는 state 를 구성하는 함수
+        ALVS_B4 ActorNetwork에 맞는 State Dict 생성
         """
         tau = float(state[0])
         B = float(state[1])
+        t_i = float(getattr(env, "t_i", 2.0))
 
-        # 다음 청크 크기
-        q_levels_sorted = sorted(list(env.quality_levels))
-        if len(q_levels_sorted) > 0 and self.last_quality not in q_levels_sorted:
-            self.last_quality = q_levels_sorted[0]
-
+        # --- [수정 1] Next Chunk Sizes는 항상 20개(ALVS 기준)로 고정 ---
+        # 실제 Env의 화질 개수와 무관하게, 학습된 네트워크는 20개의 입력을 기대함
         next_chunk_sizes = []
-        for k in q_levels_sorted:
-            size_bytes = (get_bitrate_mbps(env, k) * 1_000_000 * float(env.t_i)) / 8.0
+        for q in self.alvs_quality_levels: # 1 ~ 20
+            bitrate = self.alvs_bitrate_map[q]
+            size_bytes = (bitrate * 1_000_000 * t_i) / 8.0
             next_chunk_sizes.append(size_bytes)
         
-        # 남은 청크 수
+        # 남은 청크 비율
         if hasattr(env, "num_chunks") and hasattr(env, "k_j"):
-            chunks_remaining = float(env.num_chunks - len(env.k_j))
+            chunks_remaining_ratio = float(env.num_chunks - len(env.k_j)) / float(env.num_chunks)
         else:
-            chunks_remaining = 0.0
+            chunks_remaining_ratio = 0.0
         
-        default_k = q_levels_sorted[0] if len(q_levels_sorted) > 0 else self.last_quality
-        last_bitrate = get_bitrate_mbps(env, self.last_quality, default=get_bitrate_mbps(env, default_k, default=0.8))
+        # 이전 화질의 Bitrate (ALVS 기준)
+        last_bitrate = self.alvs_bitrate_map[self.last_quality_idx_alvs + 1]
 
-
-        # 정규화
+        # --- [수정 2] Normalization 상수 맞춤 ---
+        # ALVS_B4.py: throughput/10M, time/10.0, sizes/1M, B/10.0, tau/10.0, bitrate/5.0
         throughput_hist_norm = np.array(self.throughput_hist, dtype=np.float32) / 10_000_000.0
         dl_time_hist_norm    = np.array(self.dl_time_hist, dtype=np.float32) / 10.0
         next_chunk_sizes_norm = np.array(next_chunk_sizes, dtype=np.float32) / 1_000_000.0
 
         other_features = np.array([
             B / 10.0,
-            tau / 15.0,
+            tau / 10.0,      # [중요] 기존 15.0 -> 10.0 (ALVS_B4.py와 일치)
             last_bitrate / 5.0,
-            (chunks_remaining / float(env.num_chunks)) if hasattr(env, "num_chunks") else 0.0
+            chunks_remaining_ratio
         ], dtype=np.float32)
 
         state_dict = {
@@ -384,72 +419,128 @@ class ALVS_PolicyWrapper:
         }
         return state_dict
 
+    def _map_action_to_env(self, alvs_action_idx: int, env) -> int:
+        """
+        ALVS(20-level)의 출력을 현재 Multi-DASH Env의 화질 인덱스로 매핑
+        """
+        # 1. ALVS가 의도한 목표 비트레이트 (Mbps)
+        # self.alvs_bitrate_map은 1~20의 Key를 가짐 (이전 답변 코드 참조)
+        target_bitrate = self.alvs_bitrate_map[alvs_action_idx + 1]
+
+        # 2. 현재 Env의 비트레이트 맵 가져오기
+        # multi_dash_env.py에 의해 env.bitrate_map은 {rep_idx: mbps} 형태임
+        if not hasattr(env, "bitrate_map") or not env.bitrate_map:
+             # Map이 없으면 안전하게 0번(혹은 1번) 인덱스 반환
+            return 1 if hasattr(env, "quality_levels") and 1 in env.quality_levels else 0
+
+        # 3. Nearest Neighbor 검색
+        best_k = None
+        min_diff = float('inf')
+
+        # env.bitrate_map: {1: 0.45, 2: 0.89, ...}
+        for k, br in env.bitrate_map.items():
+            diff = abs(br - target_bitrate)
+            if diff < min_diff:
+                min_diff = diff
+                best_k = k
+        
+        # 4. 반환 (Env에 전달할 Action Index)
+        # Multi_dash_VideoStreamingEnv의 step 함수는 k_i를 받아서 self.bitrate_map[k_i]를 조회함.
+        # 따라서 Key값 자체를 반환해야 함.
+        return best_k
+
     @torch.no_grad()
     def act(self, state: np.ndarray, env) -> Tuple[int, int, int]:
-        # 직전의 step 결과로 history 갱신
+        # 1. 직전의 step 결과로 history 갱신
         self._update_hist_from_env(env)
 
+        # 2. ALVS 기준의 State Dict 생성 (20-level chunk sizes 포함)
         state_dict = self._build_state_dict(state, env)
-        q_logits, s_logits = self.network(state_dict)
+        
+        # 3. Inference
+        q_logits, s_logits = self.actor(state_dict)
 
         q_probs = torch.softmax(q_logits, dim=-1)
         s_probs = torch.softmax(s_logits, dim=-1)
 
-        q_action = int(torch.argmax(q_probs, dim=-1).item()) if self.greedy else int(torch.distributions.Categorical(q_probs).sample().item())
-        s_action = int(torch.argmax(s_probs, dim=-1).item()) if self.greedy else int(torch.distributions.Categorical(s_probs).sample().item())
+        # 4. ALVS Action (0 ~ 19) 선택
+        if self.greedy:
+            alvs_q_action = int(torch.argmax(q_probs, dim=-1).item())
+            s_action = int(torch.argmax(s_probs, dim=-1).item())
+        else:
+            alvs_q_action = int(torch.distributions.Categorical(q_probs).sample().item())
+            s_action = int(torch.distributions.Categorical(s_probs).sample().item())
 
-        q_levels_sorted = sorted(list(env.quality_levels))
-        k = q_levels_sorted[q_action]
-        return (k, s_action, 0)
+        # 내부 추적용 업데이트 (다음 스텝의 last_bitrate 계산용)
+        self.last_quality_idx_alvs = alvs_q_action
 
+        # 5. [중요] ALVS Action -> Current Env Action 매핑
+        env_k = self._map_action_to_env(alvs_q_action, env)
+        
+        return (env_k, s_action, 0)
 
 class TCLivi_PolicyWrapper:
     """
-    B5 의 ActorNetworkTCLivi 의 action index (0~7) 을 
-    이용하여 Action 반환하게 하는 클래스
+    [수정됨] B5 (TCLiVi) 의 학습 로직(20 Qualities, 2 Target Buffers)을 
+    완벽하게 반영하고, 이종 데이터셋(BBB 등)에 적응하는 Wrapper
     """
-    def __init__(self, ckpt_path: str, device: Optional[str]=None, greedy: bool=True, history_len: int=10, speed_rule_margin: float=1.0):
+    def __init__(self, ckpt_path: str, device: Optional[str]=None, greedy: bool=True, history_len: int=48, speed_rule_margin: float=1.0):
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.greedy = greedy
+        
+        # [중요] TCLivi_B5.py에 정의된 ActorNetworkTCLiVi 클래스 사용
         self.network = ActorNetworkTCLiVi().to(self.device)
+        self._load_ckpt(ckpt_path)
         self.network.eval()
 
         self.history_len = history_len
-        self.speed_rule_margin = speed_rule_margin
+        self.speed_rule_margin = speed_rule_margin # 기본값 1.0
 
-        # TCLivi feature
+        # TCLivi Feature (6 dim)
         self.num_features = 6
         self.hist = deque([np.zeros(self.num_features, dtype=np.float32) for _ in range(self.history_len)], maxlen=self.history_len)
 
-        self.action_map = {
-            0: (1, 0.5), 1: (2, 0.5), 2: (3, 0.5), 3: (4, 0.5),
-            4: (1, 0.75), 5: (2, 0.75), 6: (3, 0.75), 7: (4, 0.75)
-        } # 정규화 적용
+        # --- [1. Action Map 동기화] (Source: TCLivi_B5.py) ---
+        # B5는 20개의 화질과 2개의 타겟 버퍼(2.0, 3.0) 조합으로 총 40개의 액션을 가짐
+        self.b5_quality_levels = list(range(1, 21)) # 1 ~ 20
+        self.b5_target_buffers = [2.0, 3.0]
+        self.action_map = {}
+        
+        action_id = 0
+        for quality in self.b5_quality_levels:
+            for buf in self.b5_target_buffers:
+                self.action_map[action_id] = (quality, buf)
+                action_id += 1
+        
+        # --- [2. B5 학습용 Bitrate Map 정의] ---
+        # 네트워크 입력(Chunk Size 정규화) 및 출력 매핑에 사용
+        self.b5_bitrate_map = {
+            1: 0.045,   2: 0.089,   3: 0.131,   4: 0.178,   5: 0.221,
+            6: 0.262,   7: 0.334,   8: 0.396,   9: 0.522,   10: 0.595,
+            11: 0.791,  12: 1.032,  13: 1.244,  14: 1.546,  15: 2.133,
+            16: 2.484,  17: 3.078,  18: 3.526,  19: 3.840,  20: 4.219
+        }
 
-        self.last_quality = 1
-        self._load_ckpt(ckpt_path)
-    
+        # 초기 상태 추적용
+        self.last_quality_b5_idx = 0 # 0-based index (0 -> level 1)
+
     def _load_ckpt(self, path: str):
         ckpt = torch.load(str(Path(path).resolve()), map_location="cpu")
-
         if isinstance(ckpt, dict) and "actor" in ckpt:
             self.network.load_state_dict(ckpt["actor"])
-        
         elif isinstance(ckpt, dict):
             self.network.load_state_dict(ckpt)
-        
         else:
-            raise RuntimeError(f"[TCLivi-B5] Path 주소를 확인해주세요: {path}")
+            self.network.load_state_dict(ckpt)
         self.network.to(self.device)
-        self.network.eval()
-    
+
     def reset(self):
         self.hist = deque([np.zeros(self.num_features, dtype=np.float32) for _ in range(self.history_len)], maxlen=self.history_len)
-        self.last_quality = 1
-    
+        self.last_quality_b5_idx = 0
+
     def _update_hist_from_env(self, state: np.ndarray, env):
         """
-        env 의 내부 기록으로 TCLivi feature 구성하는 함수
+        Env의 상태를 B5 네트워크가 이해하는 형태(20-level 정규화 등)로 변환하여 히스토리 저장
         """
         tau = float(state[0])
         B = float(state[1])
@@ -457,54 +548,83 @@ class TCLivi_PolicyWrapper:
         t_i = float(getattr(env, "t_i", 2.0))
         t_buffer = float(getattr(env, "t_buffer", 4.0))
 
+        # 마지막 Env 결과 가져오기
         l_i = float(env.l_i[-1]) if hasattr(env, "l_i") and len(env.l_i) > 0 else 0.0
         d_i = float(env.d_i[-1]) if hasattr(env, "d_i") and len(env.d_i) > 0 else 0.0
-
-        k_env = int(env.k_j[-1]) if hasattr(env, "k_j") and len(env.k_j) > 0 else None
         
-        if hasattr(env, "dash_dataset") and env.dash_dataset is not None:
-            k_model = (k_env + 1) if k_env is not None else self.last_quality
-        else:
-            k_model = int(env.k_j[-1]) if k_env is not None else self.last_quality
-
-        self.last_quality = k_model
-
-        # chunk size
-        if hasattr(env, "dash_dataset") and env.dash_dataset is not None and k_env is not None:
-            bitrate_mbps = get_bitrate_mbps(env, k_env, default=0.8)
-        else:
-            bitrate_mbps = get_bitrate_mbps(env, k_model, default=0.8)
-
-        chunk_size = ((bitrate_mbps * 1_000_000.0 * t_i) / 8.0) / 1e6
-        k_norm = k_model / 4.0
-
+        # --- [3. Chunk Size 계산 수정] ---
+        # 학습 코드는 "이전 step에서 선택한 화질의 bitrate"를 기준으로 chunk size를 계산함.
+        # 따라서 현재 Env의 화질이 아니라, "B5 관점에서의 화질(last_quality_b5_idx)"을 사용해야
+        # 네트워크가 학습된 데이터 분포와 일치하는 입력을 받음.
         
+        b5_quality_level = self.last_quality_b5_idx + 1 # 1 ~ 20
+        b5_bitrate_mbps = self.b5_bitrate_map[b5_quality_level]
+        
+        # MB 단위 계산 (TCLivi_B5.py와 동일 로직)
+        # ((Mbps * 1e6 * t_i) / 8) / 1e6 = MB
+        chunk_size_MB = ((b5_bitrate_mbps * 1_000_000.0 * t_i) / 8.0) / 1e6
+
+        # --- [4. Quality Normalization 수정] ---
+        # 학습 코드는 k_i / 20.0 으로 정규화함
+        k_norm = b5_quality_level / 20.0 
+
         features = np.array(
             [
-                l_i / max(t_i, 1e-9),
-                chunk_size,
-                d_i / max(t_i, 1e-9),
-                B / max(t_buffer, 1e-9),
-                tau / max(t_buffer, 1e-9),
-                k_norm
+                l_i / max(t_i, 1e-9),       # download time norm
+                chunk_size_MB,              # chunk size (MB) - No norm in source? (Check source: Yes, raw MB value)
+                d_i / max(t_i, 1e-9),       # stall norm
+                B / max(t_buffer, 1e-9),    # buffer norm
+                tau / max(t_buffer, 1e-9),  # latency norm
+                k_norm                      # quality norm (0~1)
             ],
             dtype=np.float32
         )
         self.hist.append(features)
-    
+
+    def _map_b5_action_to_env(self, b5_k: int, env) -> int:
+        """
+        B5가 선택한 화질(1~20)을 현재 Env의 화질 Index로 매핑 (Nearest Neighbor)
+        """
+        target_bitrate = self.b5_bitrate_map[b5_k]
+        
+        # Env의 Bitrate Map이 없으면 안전하게 0 리턴
+        if not hasattr(env, "bitrate_map") or not env.bitrate_map:
+            return 0
+            
+        best_k = None
+        min_diff = float('inf')
+
+        for k, br in env.bitrate_map.items():
+            diff = abs(br - target_bitrate)
+            if diff < min_diff:
+                min_diff = diff
+                best_k = k
+        return best_k
+
     @torch.no_grad()
     def act(self, state: np.ndarray, env) -> Tuple[int, int, int]:
-        # 직전 결과를 history 에 반영
+        # 1. 히스토리 업데이트
         self._update_hist_from_env(state, env)
 
-        hist_np = np.stack(list(self.hist), axis=0)
-        state_tensor = torch.tensor(hist_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        probs = self.network(state_tensor)
-        action = int(torch.argmax(probs, dim=-1).item()) if self.greedy else int(torch.distributions.Categorical(probs).sample().item())
+        # 2. Inference
+        # Input Shape: (Batch, History, Features) -> Network 내부에서 Permute(0,2,1)로 (Batch, Feat, Hist) 변환됨
+        hist_np = np.stack(list(self.hist), axis=0) # (48, 6)
+        state_tensor = torch.tensor(hist_np, dtype=torch.float32, device=self.device).unsqueeze(0) # (1, 48, 6)
+        
+        probs = self.network(state_tensor) # Output: (1, 40)
+        
+        if self.greedy:
+            action_idx = int(torch.argmax(probs, dim=-1).item())
+        else:
+            action_idx = int(torch.distributions.Categorical(probs).sample().item())
 
-        k, tb_ratio = self.action_map[action]
-        target_buffer = tb_ratio * float(getattr(env, "t_buffer", 4.0))
+        # 3. Action Decoding (0~39 -> Quality(1~20), TargetBuffer)
+        b5_k, target_buffer = self.action_map[action_idx]
+        
+        # 내부 상태 업데이트 (다음 step의 입력 feature 생성을 위해)
+        self.last_quality_b5_idx = b5_k - 1
 
+        # 4. Speed Control (Rule-based from TCLivi_B5.py)
         B = float(state[1])
         slow_thr = target_buffer - self.speed_rule_margin
         fast_thr = target_buffer + self.speed_rule_margin
@@ -518,22 +638,10 @@ class TCLivi_PolicyWrapper:
         
         speed_idx = int(env.playback_speeds.index(speed)) if hasattr(env, "playback_speeds") else 1
 
-        # DASH Env 호환 처리
-        # DASH Env 호환 처리
-        if hasattr(env, "dash_dataset") and env.dash_dataset is not None:
-            k_env = int(k) - 1
-            if hasattr(env, "rep_groups"):
-                k_env = max(0, min(k_env, len(env.rep_groups) - 1))
-            k_to_step = k_env
-        else:
-            # [수정] Non-DASH 모드여도, 환경이 0-based 인덱스(0~3)를 사용하는 경우 변환 필요
-            # DASH_inference.py는 quality_levels가 [0, 1, 2, 3]임
-            if hasattr(env, "quality_levels") and 0 in env.quality_levels and 4 not in env.quality_levels:
-                k_to_step = int(k) - 1  # 1~4 -> 0~3 변환
-            else:
-                k_to_step = int(k)      # 기존 CARLA_based.py (1~4) 호환 유지
+        # 5. Quality Mapping (B5 20-level -> Env N-level)
+        env_k = self._map_b5_action_to_env(b5_k, env)
 
-        return (k_to_step, speed_idx, 0)
+        return (env_k, speed_idx, 0)
 # ----------------------------
 # Env creation + evaluation
 # ----------------------------
