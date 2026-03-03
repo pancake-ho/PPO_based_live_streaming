@@ -7,7 +7,7 @@ import torch.nn as nn
 from data.dash_adapter import BigBuckBunnyDataset, sintelDataset, Swiss_Dataset, Elephants_Dataset, Forest_men_Dataset
 from train.proposed import DynamicChannelModel
 
-device = torch.device("cuda" if torch.device.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DynamicChannelModel:
     # (Keep the DynamicChannelModel class exactly as it is in baseline5.py or Proposed_ppo.py)
@@ -62,6 +62,12 @@ class Multi_dash_VideoStreamingEnv:
     def __init__(self, num_chunks=300, t_buffer=4, t_i=2,
                  verbose=False, dash_dataset: Swiss_Dataset | None=None):
         
+        self.W1 = 1.0
+        self.W2 = 300
+        self.W3 = 100
+        self.W_tau = 1
+        self.verbose = verbose
+
         self.dash_dataset = dash_dataset
         if self.dash_dataset is not None:
             self.num_chunks = self.dash_dataset.num_chunks
@@ -90,8 +96,10 @@ class Multi_dash_VideoStreamingEnv:
 
                 self.bitrate_map[rep_idx] = info.bitrate_kbps / 1000.0
             
-            print(f"{type(self.dash_dataset).__name__} 데이터에 대한 Bitrate map 로드에 성공했습니다.")
-            print(f"\n 다음과 같습니다: {self.bitrate_map}")
+            self.quality_levels = rep_indices_sorted
+            
+            # print(f"{type(self.dash_dataset).__name__} 데이터에 대한 Bitrate map 로드에 성공했습니다.")
+            # print(f"\n 다음과 같습니다: {self.bitrate_map}")
         
         else:
             print("DASH 데이터셋을 로드하지 않았습니다. 코드를 확인해주세요.")
@@ -565,14 +573,32 @@ class Multi_dash_VideoStreamingEnv:
         if not self.speed_idx_j: return 1.0 # Default if no actions taken
         actual_speeds = [self.playback_speeds[idx] for idx in self.speed_idx_j]
         return sum(actual_speeds) / len(actual_speeds)
-    # get_average_quality needs to check x_j
+    
     def get_average_quality(self):
-        # Quality of chunks that were chosen *and not skipped* and successfully started playing
-        played_qualities = [self.k_j[i] for i in range(len(self.k_j))
-                            if i < len(self.x_j) and self.x_j[i] == 0 # Not skipped
-                            and i < len(self.p_i) and self.p_i[i] != float('inf')] # Played successfully
-        if not played_qualities: return 0
-        return sum(played_qualities) / len(played_qualities)
+        """
+        [수정됨] 재생된 청크들의 '인덱스'가 아닌 실제 '비트레이트(Mbps)'의 평균을 반환
+        """
+        # 1. 플레이된(스킵되지 않고, 재생 시작된) 청크의 인덱스들 추출
+        played_indices = [self.k_j[i] for i in range(len(self.k_j))
+                          if i < len(self.x_j) and self.x_j[i] == 0 # Not skipped
+                          and i < len(self.p_i) and self.p_i[i] != float('inf')] # Played successfully
+
+        if not played_indices: 
+            return 0.0
+
+        # 2. 인덱스(1~20)를 실제 비트레이트(Mbps)로 변환
+        played_bitrates = []
+        for k in played_indices:
+            # bitrate_map에서 Mbps 값 조회 (없으면 0.0)
+            # self.bitrate_map은 {1: 0.045, ..., 20: 4.219} 형태
+            if hasattr(self, "bitrate_map") and k in self.bitrate_map:
+                played_bitrates.append(self.bitrate_map[k])
+            else:
+                # 맵에 없는 경우 (예외 처리), 단순히 k를 넣거나 0 처리
+                played_bitrates.append(0.0) 
+
+        # 3. 실제 비트레이트의 평균 반환
+        return sum(played_bitrates) / len(played_bitrates)
 
     def get_average_capacity(self):
         if not self.interval_capacities: return 0

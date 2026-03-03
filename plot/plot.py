@@ -23,6 +23,7 @@ from collections import deque
 from matplotlib.ticker import MaxNLocator
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
+import sys
 import argparse
 import importlib.util
 import os
@@ -35,6 +36,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 from baseline.train.B4.ALVS_B4 import ActorNetwork_ALVS
 from baseline.train.B5.TCLivi_B5 import ActorNetworkTCLiVi
@@ -86,52 +90,92 @@ def parse_datasets_arg(s: str) -> list[DatasetSpec]:
 
 def make_env(env_module, ds: DatasetSpec, t_buffer: float, snr_db: float | None):
     """
-    DASH 데이터셋을 로드하고, 환경을 구성하는 함수
+    DASH 데이터셋을 로드하고, 올바른 환경(Multi_dash)을 구성하는 함수
     """
-    # 데이터셋 로드
+    # 1. 데이터셋 클래스 로딩 헬퍼
+    def get_dataset_class(module, class_name):
+        # proposed.py 확인
+        if hasattr(module, class_name): return getattr(module, class_name)
+        # multi_dash_env.py 확인
+        try:
+            import multi_dash_env
+            if hasattr(multi_dash_env, class_name): return getattr(multi_dash_env, class_name)
+        except ImportError: pass
+        raise AttributeError(f"'{class_name}'을 찾을 수 없습니다.")
+
+    # 2. 데이터셋 로드
     dataset = None
     if ds.kind.lower() not in ("non-dash", "none"):
-        if ds.kind.lower() in ("bbb", "bigbuckbunny"): # 더 추가 가능
-            dataset = env_module.BigBuckBunnyDataset(ds.csv_path)
+        if ds.kind.lower() in ("bbb", "bigbuckbunny"):
+            dataset = get_dataset_class(env_module, "BigBuckBunnyDataset")(ds.csv_path)
         elif ds.kind.lower() in ("swiss", "swiss_account"):
-            dataset = env_module.Swiss_Dataset(ds.csv_path)
+            dataset = get_dataset_class(env_module, "Swiss_Dataset")(ds.csv_path)
         elif ds.kind.lower() in ("elephants"):
-            dataset = env_module.Elephants_Dataset(ds.csv_path)
+            dataset = get_dataset_class(env_module, "Elephants_Dataset")(ds.csv_path)
         elif ds.kind.lower() in ("forest_men", "Forest_men"):
-            dataset = env_module.Forest_men_Dataset(ds.csv_path)
+            dataset = get_dataset_class(env_module, "Forest_men_Dataset")(ds.csv_path)
         else:
-            raise RuntimeError(f"존재하지 않는 데이터셋입니다. 이름을 확인하세요: {ds.kind}")
+            raise RuntimeError(f"존재하지 않는 데이터셋입니다: {ds.kind}")
         
-    # SNR 설정
+    # 3. SNR 설정
     target_snr = float(snr_db) if snr_db is not None else 35.0
     
-    # env 생성
-    if hasattr(env_module, "Multi_dash_VideoStreamingEnv"):
-        envclass = env_module.Multi_dash_VideoStreamingEnv
+    # 4. [핵심 수정] Env Class 선택 로직 개선
+    # 데이터셋이 존재하면 -> 무조건 Multi_dash_VideoStreamingEnv (inference용) 사용
+    envclass = None
+    
+    if dataset is not None:
+        # 우선 multi_dash_env 모듈에서 찾기 (가장 확실함)
+        try:
+            import multi_dash_env
+            if hasattr(multi_dash_env, "Multi_dash_VideoStreamingEnv"):
+                envclass = multi_dash_env.Multi_dash_VideoStreamingEnv
+        except ImportError:
+            pass
+        
+        # 없으면 env_module(proposed.py)에서 찾기
+        if envclass is None and hasattr(env_module, "Multi_dash_VideoStreamingEnv"):
+            envclass = env_module.Multi_dash_VideoStreamingEnv
+            
+    # 데이터셋이 없거나 위에서 못 찾은 경우 기존 로직 (Training용 Env)
+    if envclass is None:
+        if hasattr(env_module, "VideoStreamingEnvCombined"):
+            envclass = env_module.VideoStreamingEnvCombined
+        else:
+            # Fallback
+            import multi_dash_env
+            envclass = multi_dash_env.VideoStreamingEnvCombined
+
+    # 5. 환경 생성 (인자 구분)
+    if dataset is not None:
+        # Multi_dash 환경은 dash_dataset 인자를 받음
+        env = envclass(
+            t_buffer=float(t_buffer),
+            verbose=False,
+            dash_dataset=dataset
+        )
     else:
-        envclass = env_module.VideoStreamingEnvCombined
+        # Training 환경은 dash_dataset 인자를 받지 않음
+        env = envclass(
+            t_buffer=float(t_buffer),
+            verbose=False
+            # num_chunks 등 기본값 사용
+        )
 
-    env = envclass(
-        t_buffer = float(t_buffer),
-        verbose=False,
-        dash_dataset=dataset,
-    )
-
-    # Channel Model 업데이트 (SNR 적용)
+    # 6. Channel Model 업데이트
     if hasattr(env, "channel_model"):
         env.channel_model.gamma = 10 ** (target_snr / 10.0)
 
-    # 다양한 DASH 데이터에따라 유동적으로 비트레이트 조절하는 지 검증
+    # 7. Bitrate Map 설정 (데이터셋 기반)
     if dataset is not None and (not hasattr(env, "bitrate_map") or not env.bitrate_map):
-        print("[WARN] Env에 bitrate_map이 생성되지 않았습니다. 수동으로 생성합니다.")
         env.bitrate_map = {}
         first_chunk_idx = 1
         if hasattr(dataset, "chunk_table") and first_chunk_idx in dataset.chunk_table:
             reps = dataset.chunk_table[first_chunk_idx]
-            # bitrate 기준 정렬
             sorted_reps = sorted(reps.items(), key=lambda x: x[1].bitrate_kbps)
             for rep_idx, info in sorted_reps:
                 env.bitrate_map[rep_idx] = info.bitrate_kbps / 1000.0
+                
     return env
 
 
@@ -216,8 +260,9 @@ class Test_PPOAgent:
     def __init__(
         self,
         env_module,
-        model_episode_to_load: str,
+        model_episode_to_load: str = None,
         model_dir='models',
+        actor_ckpt: str = None,
         learn_speed: bool = True,
         learn_skip: bool = True,
         fixed_speed_idx: int = 1,
@@ -234,6 +279,7 @@ class Test_PPOAgent:
         
         self.model_episode = model_episode_to_load
         self.model_dir = model_dir
+        self.actor_ckpt = actor_ckpt
 
         self._load_model()
         self.actor.eval()
@@ -246,34 +292,44 @@ class Test_PPOAgent:
 
 
     def _load_model(self):
-        model_name_base = f'Combined_ppo_episode_{self.model_episode}'
-        actor_filename = f'{model_name_base}_actor.pth'
-        actor_path = os.path.join(self.model_dir, actor_filename)
+        # [수정] actor_ckpt가 직접 제공된 경우 (B2, B3 등)
+        if self.actor_ckpt is not None:
+            actor_path = self.actor_ckpt
+        # 제공되지 않은 경우, 디렉토리와 에피소드 번호로 조합 (Proposed)
+        else:
+            model_name_base = f'Combined_ppo_episode_{self.model_episode}'
+            actor_filename = f'{model_name_base}_actor.pth'
+            actor_path = os.path.join(self.model_dir, actor_filename)
 
-        print(f"C: {actor_path}")
+        print(f"Loading Model: {actor_path}")
 
         try:
             self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
             print(f"Combined Actor {actor_path} 불러오기에 성공했습니다.")
         
         except FileNotFoundError:
-            print(f"{self.model_dir} 디렉토리에서 Combined 모델 파일 {actor_filename} 을 찾을 수 없습니다.")
-            try:
-                print(f"모델 디렉토리 내용: {os.listdir(self.model_dir)}")
-            except FileNotFoundError:
-                print(f"models 디렉토리가 존재하지 않습니다.")
-            except Exception as e:
-                print(f"모델을 불러오는 도중 다음과 같은 오류가 발생했습니다: {e}")
+            print(f"오류: 파일 {actor_path} 을(를) 찾을 수 없습니다.")
+            # 디버깅 힌트 제공
+            if self.actor_ckpt:
+                print(f"지정된 경로가 올바른지 확인하세요.")
+            else:
+                print(f"{self.model_dir} 디렉토리를 확인하세요.")
 
         except Exception as e:
             print(f"모델을 불러오는 도중 다음과 같은 오류가 발생했습니다: {e}")
+            # 치명적인 오류가 아니면 넘어갈 수 있도록 exit() 제거 또는 유지 선택
+            # 여기서는 파일 경로 문제일 확률이 높으므로 exit() 대신 경고만 출력하고 진행할 수도 있지만,
+            # 모델 없이 진행하면 에러나니까 exit() 유지
             exit()
 
     def reset(self):
         pass
 
     @torch.no_grad()
-    def select_action(self, state: np.ndarray) -> Tuple[int, int, int]:
+    def act(self, state: np.ndarray, env=None) -> Tuple[int, int, int]:
+        # [수정] select_action -> act 로 변경
+        # [수정] env=None 인자 추가 (run_one_episode 함수와의 호환성 유지)
+        
         state_tensor = torch.FloatTensor(state).to(self.device)
         if state_tensor.dim() == 1:
             state_tensor = state_tensor.unsqueeze(0)
@@ -292,6 +348,7 @@ class Test_PPOAgent:
         else:
             speed_action_idx = int(self.fixed_speed_idx) # a_v
 
+        # skip
         if self.learn_skip:
             skip_action_idx = int(torch.argmax(skip_probs, dim=-1).item()) # a_x
         else:
@@ -299,7 +356,6 @@ class Test_PPOAgent:
 
         quality_level = quality_action_idx + 1
         return (quality_level, speed_action_idx, skip_action_idx)
-
 
 class ActorNetwork_ALVS(nn.Module):
     def __init__(self):
@@ -988,10 +1044,10 @@ def main():
 
     env_module = load_module_from_path(args.env_path, module_name="env_module")
 
-    b2_path = "./baseline/train/proposed/baseline_models/b2/b2_25000_actor.pth"
-    b3_path = "./baseline/train/proposed/baseline_models/b3/b3_50000_actor.pth"
-    b4_path = "./baseline/train/B4/models/ALVS_A3C_actor_ep15000.pth"
-    b5_path = "./baseline/train/B5/models/TCLiVi_rule_based_speed_actor_ep50000.pth"
+    b2_path = Path("./train/proposed/baseline_models/b2/b2_25000_actor.pth")
+    b3_path = Path("./train/proposed/baseline_models/b3/b3_50000_actor.pth")
+    b4_path = Path("./train/B4/models/ALVS_A3C_actor_ep15000.pth")
+    b5_path = Path("./train/B5/models/TCLiVi_rule_based_speed_actor_ep50000.pth")
 
     # Proposed checkpoint auto-find unless user specifies
     proposed_ckpt = args.dash_ckpt.strip() or args.dash_actor.strip() or auto_find_proposed_ckpt(episode=50000)
@@ -1013,7 +1069,7 @@ def main():
     # Proposed (learn all heads)
     proposed_policy = Test_PPOAgent(
         env_module,
-        model_episode_to_load=args.episodes,
+        actor_ckpt=proposed_ckpt,
         learn_speed=True,
         learn_skip=True,
         greedy=True,

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 venv/
 .env
+.gitignore
 
 # 연구 데이터 (용량 큰 것들)
 *.mp4
@@ -11,10 +12,18 @@ venv/
 *.pth
 *.pt
 *.pdf
-*.mpd
-*.csv
 *.npy
 *.txt
-baseline/data/
-logs/
-baseline/gst/
+*.Identifier
+transmit_SNR35_DASH/
+Live/
+DASH/
+Common/
+Paper/
+Playback/
+plot/gst/
+plot/models/
+plot/results/
+plot/train/B4/models
+plot/train/B5/models
+plot/train/B5/results

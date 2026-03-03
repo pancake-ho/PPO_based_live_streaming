@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from collections import deque
 
 # Proposed.py 로부터 요소들을 가져오기 위한 과정
-current_dir = os.path.dirname(os.path.abspath(__path__))
+current_dir = os.path.dirname(os.path.abspath(__file__))
 proposed_dir = os.path.join(current_dir, '../proposed')
 sys.path.append(proposed_dir)
 
@@ -443,26 +443,19 @@ class VideoStreamingEnv_ALVS:
     # --- MODIFIED: ALVS Eq. (8)에 맞춰 보상 함수 재작성 ---
     def _get_reward(self, k_i, x_i, last_complete_d_i, tau_i_plus_1):
         """计算奖励"""
+        """Unified Reward Function"""
         quality_reward = 0
         if x_i == 0:
-            
-            quality_reward = self.W1 * (k_i**2) 
-
-        # 卡顿惩罚 (基于上一个播放块的卡顿)
+            quality_reward = self.W1 * (k_i**2)
+        
         stall_penalty = self.W2 * last_complete_d_i
-
-        
-        delay_penalty = self.W_tau * (tau_i_plus_1 - self.t_i*x_i) ** 2
-
-        # 跳过惩罚
+        # Safe tau calculation
+        safe_tau = tau_i_plus_1 if (tau_i_plus_1 != float('inf') and tau_i_plus_1 > -100) else 10.0
+        delay_penalty = self.W_tau * (safe_tau - self.t_i * x_i)**2
         skip_penalty = self.W3 * x_i
-
-        raw_reward = quality_reward  - delay_penalty - skip_penalty - stall_penalty
-        reward = max(min(raw_reward, 20), -20)
-
         
-
-        return reward
+        raw_reward = quality_reward - stall_penalty - delay_penalty - skip_penalty
+        return max(min(raw_reward, 20), -20) # Clip
 
     # --- Add back get_skip_statistics ---
     def get_skip_statistics(self):
