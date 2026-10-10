@@ -1,35 +1,17 @@
-#!/usr/bin/env python
-# coding: utf-8
-
+import sys
 import os
-import numpy as np
-import matplotlib.pyplot as plt
-import time
-from collections import deque
 import torch
+import numpy as np
 import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Categorical
 
-# 检查GPU可用性
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Changed back to cuda:0 for consistency
-print(f"사용 장치: {device}")
+from data.dash_adapter import BigBuckBunnyDataset, sintelDataset, Swiss_Dataset, Elephants_Dataset, Forest_men_Dataset
+from train.proposed import DynamicChannelModel
 
-# 创建保存结果的目录
-if not os.path.exists('results'):
-    os.makedirs('results')
-
-# 创建保存模型的目录
-if not os.path.exists('models'):
-    os.makedirs('models')
-
-#################################
-# 环境部分 (Combined Speed & Skip)
-#################################
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DynamicChannelModel:
     # (Keep the DynamicChannelModel class exactly as it is in baseline5.py or Proposed_ppo.py)
-    def __init__(self, W=1e6, gamma_dB=35, distance=20, beta=2, sigma_dB=4, mu_dB=0): # Example gamma
+    def __init__(self, W=1e6, gamma_dB=36.2, distance=20, beta=2, sigma_dB=4, mu_dB=0): # Example gamma
         self.W = W
         self.gamma = 10 ** (gamma_dB / 10)
         self.distance = distance
@@ -75,43 +57,55 @@ class DynamicChannelModel:
             'channel_gain': self.current_channel_gain,
             'components': self.channel_components
         }
-
-
-class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
+    
+class Multi_dash_VideoStreamingEnv:
     def __init__(self, num_chunks=300, t_buffer=4, t_i=2,
-                 W1=1, W2=300, W3=100.0, W_tau=1, # Added W3 back
-                 verbose=False):
-        """初始化结合 Skip 和 Speed 的视频流环境"""
-        # Call parent __init__ from baseline5's VideoStreamingEnv
-      
-
-        self.num_chunks = num_chunks
-        self.t_buffer = t_buffer
-        self.t_i = t_i
+                 verbose=False, dash_dataset: Swiss_Dataset | None=None):
         
-        #self.quality_levels = [1, 2, 3, 4]
-        self.quality_levels = list(range(1, 21))
-        self.max_quality = max(self.quality_levels)
+        self.W1 = 1.0
+        self.W2 = 300
+        self.W3 = 100
+        self.W_tau = 1
         self.verbose = verbose
-        self.W1 = W1  # 质量奖励权重
-        self.W2 = W2  # 卡顿惩罚权重
-        # self.W3 = W3 # 跳过惩罚权重 (REMOVED)
-        self.W_tau = W_tau  # 延迟惩罚权重
 
-        # --- Playback Speed Definition ---
+        self.dash_dataset = dash_dataset
+        if self.dash_dataset is not None:
+            self.num_chunks = self.dash_dataset.num_chunks
+            self.t_i = self.dash_dataset.get_chunk_duration(1)
+        else:
+            self.num_chunks = num_chunks
+            self.t_i = t_i
+        
+        self.t_buffer = t_buffer
+        self.bitrate_map = {}
+
+        if self.dash_dataset is not None:
+            first_chunk_idx = 1
+            # 첫 번째 청크에 대한 모든 rep 정보 가져오기
+            reps_for_first = self.dash_dataset.chunk_table[first_chunk_idx]
+
+            # bitrate 기준으로 정렬
+            sorted_reps = sorted(
+                reps_for_first.items(),
+                key=lambda x: x[1].bitrate_kbps
+            )
+
+            rep_indices_sorted = []
+            for rep_idx, info in sorted_reps:
+                rep_indices_sorted.append(rep_idx)
+
+                self.bitrate_map[rep_idx] = info.bitrate_kbps / 1000.0
+            
+            self.quality_levels = rep_indices_sorted
+            
+            # print(f"{type(self.dash_dataset).__name__} 데이터에 대한 Bitrate map 로드에 성공했습니다.")
+            # print(f"\n 다음과 같습니다: {self.bitrate_map}")
+        
+        else:
+            print("DASH 데이터셋을 로드하지 않았습니다. 코드를 확인해주세요.")
+            sys.exit()
+        
         self.playback_speeds = [0.9, 1.0, 1.1]
-        #self.playback_speeds = [0.8, 1.0, 1.2]
-        self.num_speed_levels = len(self.playback_speeds)
-        # --- End Playback Speed Definition ---
-        self.bitrate_map = {
-            1: 0.045,   2: 0.089,   3: 0.131,   4: 0.178,   5: 0.221,
-            6: 0.262,   7: 0.334,   8: 0.396,   9: 0.522,   10: 0.595,
-            11: 0.791,  12: 1.032,  13: 1.244,  14: 1.546,  15: 2.133,
-            16: 2.484,  17: 3.078,  18: 3.526,  19: 3.840,  20: 4.219
-        }
-        #self.bitrate_map = {
-         #   1: 0.8, 2: 1.2, 3: 2.4, 4: 4.8
-        #}
         self.channel_model = DynamicChannelModel()
 
         # --- 状态变量 ---
@@ -135,8 +129,6 @@ class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
         # self.cumulative_skips = 0 # (REMOVED)
         self.state = None
 
-        
-        self.W3 = W3  # 跳过惩罚权重 (Re-introduced)
         self.x_j = [] # 跳过决策 (Re-introduced)
         self.cumulative_skips = 0 # (Re-introduced)
         # --- End Skip specific elements ---
@@ -148,7 +140,6 @@ class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
         self.reset() # Call the modified reset
 
     def reset(self):
-        """重置环境 (Combined Version)"""
         # Call parent reset first
         self.interval_capacities = {}
         self.received_chunks = []
@@ -185,7 +176,7 @@ class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
         # Recalculate initial state using the correct get_state_for_decision
         self.state = self.get_state_for_decision(0)
         return self.state
-
+    
     def calculate_remaining_play_time(self, calculation_time, decision_chunk_idx):
         """
         计算缓冲区剩余播放时间 (Combined Version)
@@ -582,14 +573,32 @@ class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
         if not self.speed_idx_j: return 1.0 # Default if no actions taken
         actual_speeds = [self.playback_speeds[idx] for idx in self.speed_idx_j]
         return sum(actual_speeds) / len(actual_speeds)
-    # get_average_quality needs to check x_j
+    
     def get_average_quality(self):
-        # Quality of chunks that were chosen *and not skipped* and successfully started playing
-        played_qualities = [self.k_j[i] for i in range(len(self.k_j))
-                            if i < len(self.x_j) and self.x_j[i] == 0 # Not skipped
-                            and i < len(self.p_i) and self.p_i[i] != float('inf')] # Played successfully
-        if not played_qualities: return 0
-        return sum(played_qualities) / len(played_qualities)
+        """
+        [수정됨] 재생된 청크들의 '인덱스'가 아닌 실제 '비트레이트(Mbps)'의 평균을 반환
+        """
+        # 1. 플레이된(스킵되지 않고, 재생 시작된) 청크의 인덱스들 추출
+        played_indices = [self.k_j[i] for i in range(len(self.k_j))
+                          if i < len(self.x_j) and self.x_j[i] == 0 # Not skipped
+                          and i < len(self.p_i) and self.p_i[i] != float('inf')] # Played successfully
+
+        if not played_indices: 
+            return 0.0
+
+        # 2. 인덱스(1~20)를 실제 비트레이트(Mbps)로 변환
+        played_bitrates = []
+        for k in played_indices:
+            # bitrate_map에서 Mbps 값 조회 (없으면 0.0)
+            # self.bitrate_map은 {1: 0.045, ..., 20: 4.219} 형태
+            if hasattr(self, "bitrate_map") and k in self.bitrate_map:
+                played_bitrates.append(self.bitrate_map[k])
+            else:
+                # 맵에 없는 경우 (예외 처리), 단순히 k를 넣거나 0 처리
+                played_bitrates.append(0.0) 
+
+        # 3. 실제 비트레이트의 평균 반환
+        return sum(played_bitrates) / len(played_bitrates)
 
     def get_average_capacity(self):
         if not self.interval_capacities: return 0
@@ -618,10 +627,7 @@ class VideoStreamingEnvCombined: # Inherit from baseline5's Env for structure
         valid_d_values = [d for d in self.d_i if isinstance(d, (int, float)) and d != float('inf')]
         if not valid_d_values: return 0.0
         return sum(valid_d_values) / len(valid_d_values)
-
-
-
-
+    
 # --- Constants ---
 LEARNING_RATE = 1e-4
 GAMMA = 0.96
@@ -705,375 +711,6 @@ class CriticNetwork(nn.Module):
         value = self.network(state)
         return value
 
-class PPOAgentCombined: # Inherit from baseline5's PPOAgent for structure
-    def __init__(self):
-        # --- Use the new Actor Network ---
-        self.actor = ActorNetworkCombined().to(device)
-        # --- Critic remains the same ---
-        self.critic = CriticNetwork().to(device)
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=LEARNING_RATE)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=LEARNING_RATE)
 
-        # --- Modified Experience Storage ---
-        self.states = []
-        self.actions_quality = []
-        self.actions_speed = [] # Keep speed index
-        self.actions_skip = []  # Add skip action storage
-        self.rewards = []
-        self.next_states = []
-        self.dones = []
-        self.log_probs_quality = []
-        self.log_probs_speed = [] # Keep speed log_prob
-        self.log_probs_skip = []  # Add skip log_prob storage
-        self.values = []
-        # --- End Modification ---
-
-    def select_action(self, state):
-        with torch.no_grad():
-            # Get all three probability distributions
-            quality_probs, speed_probs, skip_probs = self.actor(state) # Modified call
-
-            # Sample quality action (0, 1, 2, 3)
-            quality_distribution = Categorical(quality_probs)
-            quality_action = quality_distribution.sample()
-
-            # Sample Speed Action (0, 1, 2)
-            speed_distribution = Categorical(speed_probs)
-            speed_action = speed_distribution.sample()
-
-            # --- Sample Skip Action ---
-            skip_distribution = Categorical(skip_probs)
-            skip_action = skip_distribution.sample() # Output: 0 or 1
-            # --- End Sampling ---
-
-            # Calculate log probabilities for all three
-            log_prob_quality = quality_distribution.log_prob(quality_action)
-            log_prob_speed = speed_distribution.log_prob(speed_action)
-            log_prob_skip = skip_distribution.log_prob(skip_action) # Calculate skip log_prob
-
-            value = self.critic(state)
-
-        # Return (quality 1-4, speed_idx 0-2, skip 0-1), log_prob_q, log_prob_s, log_prob_sk, value
-        return (quality_action.item() + 1, speed_action.item(), skip_action.item()), \
-               log_prob_quality.item(), log_prob_speed.item(), log_prob_skip.item(), value.item()
-
-    def store_experience(self, state, action, reward, next_state, done,
-                         log_prob_quality, log_prob_speed, log_prob_skip, value): # Added log_prob_skip
-        # --- Modified Storage ---
-        self.states.append(state)
-        # action = (k_i, speed_idx, x_i)
-        self.actions_quality.append(action[0] - 1) # Quality as 0-3
-        self.actions_speed.append(action[1])      # Speed index as 0-2
-        self.actions_skip.append(action[2])       # Skip as 0-1
-        self.rewards.append(reward)
-        self.next_states.append(next_state)
-        self.dones.append(done)
-        self.log_probs_quality.append(log_prob_quality)
-        self.log_probs_speed.append(log_prob_speed)
-        self.log_probs_skip.append(log_prob_skip) # Store skip log_prob
-        self.values.append(value)
-        # --- End Modification ---
-
-    def clear_memory(self):
-        # --- Modified Clearing ---
-        self.states = []
-        self.actions_quality = []
-        self.actions_speed = []
-        self.actions_skip = []      # <--- 确保清空
-        self.rewards = []
-        self.next_states = []
-        self.dones = []
-        self.log_probs_quality = []
-        self.log_probs_speed = []
-        self.log_probs_skip = []      # <--- 确保清空
-        self.values = []
-        # --- End Modification ---
-
-    def compute_returns_and_advantages(self):
-        # --- Compute GAE ---
-        rewards = torch.tensor(self.rewards, dtype=torch.float32).to(device)
-        dones = torch.tensor(self.dones, dtype=torch.float32).to(device)
-        values = torch.tensor(self.values, dtype=torch.float32).to(device)
-
-        # Get value of the last next_state
-        with torch.no_grad():
-            last_next_state = torch.FloatTensor(self.next_states[-1]).to(device)
-            last_value = self.critic(last_next_state).item()
-
-        returns = torch.zeros_like(rewards).to(device)
-        advantages = torch.zeros_like(rewards).to(device)
-        last_gae_lam = 0
-
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_non_terminal = 1.0 - dones[t]  # Check if last state was terminal
-                next_values = last_value
-            else:
-                next_non_terminal = 1.0 - dones[t+1]  # If next step was terminal
-                next_values = values[t+1]
-
-            delta = rewards[t] + GAMMA * next_values * next_non_terminal - values[t]
-            last_gae_lam = delta + GAMMA * LAMBDA * next_non_terminal * last_gae_lam
-            advantages[t] = last_gae_lam
-            returns[t] = advantages[t] + values[t]  # Return = Advantage + Value
-
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        return returns, advantages
-
-    def update(self):
-        returns, advantages = self.compute_returns_and_advantages()
-        # +++ DEBUGGING +++
-        #print("-" * 20)
-       # print(f"DEBUG: Length log_probs_quality: {len(self.log_probs_quality)}")
-        #print(f"DEBUG: Length log_probs_speed: {len(self.log_probs_speed)}")
-        #print(f"DEBUG: Length log_probs_skip: {len(self.log_probs_skip)}")
-        # Check if lengths are equal before proceeding
-        #if not (len(self.log_probs_quality) == len(self.log_probs_speed) == len(self.log_probs_skip)):
-         #   print("ERROR: Log probability list lengths do not match before tensor conversion!")
-            # Optionally raise an error or handle differently
-            # raise ValueError("Log probability list lengths mismatch")
-       # print("-" * 20)
-        # +++ END DEBUGGING +++
-        # --- Convert Combined Data to Tensors ---
-        states = torch.FloatTensor(np.array(self.states)).to(device)
-        actions_quality = torch.LongTensor(self.actions_quality).to(device)
-        actions_speed = torch.LongTensor(self.actions_speed).to(device)
-        actions_skip = torch.LongTensor(self.actions_skip).to(device) # Skip actions tensor
-        old_log_probs_quality = torch.FloatTensor(self.log_probs_quality).to(device)
-        old_log_probs_speed = torch.FloatTensor(self.log_probs_speed).to(device)
-        old_log_probs_skip = torch.FloatTensor(self.log_probs_skip).to(device) # Skip log_probs tensor
-        # --- End Conversion ---
-
-        # Combine old log probs (sum log probs = multiply probs)
-        old_log_probs = old_log_probs_quality + old_log_probs_speed + old_log_probs_skip # Combine all three
-
-        for _ in range(EPOCHS):
-            num_samples = len(self.states)
-            indices = np.arange(num_samples)
-            np.random.shuffle(indices)
-
-            for start in range(0, num_samples, BATCH_SIZE):
-                end = start + BATCH_SIZE
-                batch_indices = indices[start:end]
-
-                # --- Get Batch Data (including skip) ---
-                batch_states = states[batch_indices]
-                batch_actions_quality = actions_quality[batch_indices]
-                batch_actions_speed = actions_speed[batch_indices]
-                batch_actions_skip = actions_skip[batch_indices] # Skip actions batch
-                batch_old_log_probs = old_log_probs[batch_indices]
-                batch_returns = returns[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                # --- End Batch Data ---
-
-                # Evaluate current policy
-                quality_probs, speed_probs, skip_probs = self.actor(batch_states) # Get all three prob sets
-                value_predictions = self.critic(batch_states).squeeze()
-
-                # --- Calculate New Log Probs and Entropy ---
-                quality_dist = Categorical(quality_probs)
-                speed_dist = Categorical(speed_probs)
-                skip_dist = Categorical(skip_probs) # Skip distribution
-
-                new_log_probs_quality = quality_dist.log_prob(batch_actions_quality)
-                new_log_probs_speed = speed_dist.log_prob(batch_actions_speed)
-                new_log_probs_skip = skip_dist.log_prob(batch_actions_skip) # New skip log_prob
-
-                # Combine new log probs
-                new_log_probs = new_log_probs_quality + new_log_probs_speed + new_log_probs_skip
-
-                # Combine entropy
-                entropy = (quality_dist.entropy() + speed_dist.entropy() + skip_dist.entropy()).mean() # Combine all three entropies
-                # --- End Calculation ---
-
-                # PPO ratio and loss calculation remains structurally the same
-                ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON) * batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean() - entropy_coef * entropy
-                critic_loss = nn.MSELoss()(value_predictions, batch_returns)
-
-                # Updates remain the same
-                self.actor_optimizer.zero_grad()
-                # Retain graph might be needed if entropy calculation involves ops not covered by default backward
-                actor_loss.backward(retain_graph=True) # Keep retain_graph=True for safety with multiple heads/entropy
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                self.actor_optimizer.step()
-
-                self.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                self.critic_optimizer.step()
-
-    # --- Update Save/Load Filenames ---
-    def save_models(self, episode):
-        """保存模型 (Combined Version)"""
-        model_name_base = f'Combined_ppo_episode_{episode}'
-        torch.save(self.actor.state_dict(), f'models/{model_name_base}_actor.pth')
-        torch.save(self.critic.state_dict(), f'models/{model_name_base}_critic.pth')
-        print(f"Combined Models saved for episode {episode}")
-
-    def load_models(self, episode):
-        """加载模型 (Combined Version)"""
-        model_name_base = f'Combined_ppo_episode_{episode}'
-        actor_path = f'models/{model_name_base}_actor.pth'
-        critic_path = f'models/{model_name_base}_critic.pth'
-        try:
-            self.actor.load_state_dict(torch.load(actor_path, map_location=device))
-            self.critic.load_state_dict(torch.load(critic_path, map_location=device))
-            print(f"Combined Models loaded from episode {episode}")
-        except FileNotFoundError:
-            print(f"Error: Could not find Combined model files for episode {episode}.")
-        except Exception as e:
-            print(f"Error loading Combined models: {e}")
-    # --- End Update ---
-
-
-# #################################
-# 训练函数 (Combined Version)
-# #################################
-
-def train_combined(): # Renamed function
-    # --- Instantiate Combined Environment and Agent ---
-    # Adjust weights (W1, W2, W3, W_tau) as needed for the combined strategy
-    env = VideoStreamingEnvCombined(num_chunks=300, verbose=False,
-                                    W1=1, W2=30, W3=100.0, W_tau=0.5) # Example weights
-
-    agent = PPOAgentCombined()
-    # --- End Instantiation ---
-
-    # --- Adjust Logging ---
-    episode_rewards = []
-    episode_lengths = []
-    episode_avg_capacities = []
-    episode_stall_times = []
-    episode_skipped = [] # Add back skipped tracking
-    episode_played = []  # Add back played tracking
-    episode_avg_speeds = [] # Keep average speed tracking
-    episode_avg_tau_i = []
-    episode_avg_qualities = []
-    update_count = 0
-    # --- End Adjustment ---
-
-    # --- Update Save Paths ---
-    results_prefix = "Combined_ppo"
-    models_prefix = "Combined_ppo"
-    # --- End Update ---
-
-
-    if not os.path.exists('results'): os.makedirs('results')
-    start_time_train = time.time()
-
-    for episode in range(MAX_EPISODES):
-        state = env.reset()
-        if not isinstance(state, np.ndarray): state = np.array(state, dtype=np.float32)
-
-        episode_reward = 0
-        episode_step = 0
-        done = False
-
-        for step in range(NUM_STEPS):
-            if not isinstance(state, np.ndarray): state = np.array(state, dtype=np.float32)
-
-            # --- Get Combined Action ---
-            action, log_prob_quality, log_prob_speed, log_prob_skip, value = agent.select_action(state)
-            # --- End Get ---
-
-            next_state, reward, done, _ = env.step(action) # Pass combined action
-
-            if not isinstance(next_state, np.ndarray): next_state = np.array(next_state, dtype=np.float32)
-            if state.shape != (STATE_DIM,): state = state.reshape(STATE_DIM)
-            if next_state.shape != (STATE_DIM,): next_state = next_state.reshape(STATE_DIM)
-
-            # --- Store Combined Experience ---
-            agent.store_experience(state, action, reward, next_state, done,
-                                 log_prob_quality, log_prob_speed, log_prob_skip, value)
-            # --- End Store ---
-
-            state = next_state
-            episode_reward += reward
-            episode_step += 1
-            if done: break
-
-        if len(agent.states) > 0:
-             agent.update()
-             agent.clear_memory()
-             update_count += 1
-
-        # --- Update Logging ---
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_step)
-        avg_capacity = env.get_average_capacity()
-        episode_avg_capacities.append(avg_capacity)
-        total_stall = env.get_total_stall_time()
-        episode_stall_times.append(total_stall)
-        skipped, played_count = env.get_skip_statistics() # Use the restored function
-        episode_skipped.append(skipped)                   # Log skips
-        episode_played.append(played_count)               # Log played
-        avg_speed = env.get_average_speed()
-        episode_avg_speeds.append(avg_speed)
-        avg_tau_i = env.get_average_tau_i()
-        episode_avg_tau_i.append(avg_tau_i)
-        avg_quality = env.get_average_quality()
-        episode_avg_qualities.append(avg_quality)
-        # --- End Update ---
-
-        if (episode + 1) % 100 == 0:
-            # --- Update Averaging and Printing ---
-            recent_rewards = episode_rewards[-100:]
-            recent_avg_speeds = episode_avg_speeds[-100:]
-            recent_avg_tau_i = episode_avg_tau_i[-100:]
-            recent_avg_qualities = episode_avg_qualities[-100:]
-            recent_stall_times = episode_stall_times[-100:]
-            recent_avg_capacities = episode_avg_capacities[-100:]
-            recent_lengths = episode_lengths[-100:]
-            recent_skipped = episode_skipped[-100:] # Get recent skips
-            recent_played_counts = episode_played[-100:] # Get recent played
-
-            avg_reward = np.mean(recent_rewards) if recent_rewards else 0
-            avg_length = np.mean(recent_lengths) if recent_lengths else 0
-            avg_capacity_mbps = np.mean(recent_avg_capacities) if recent_avg_capacities else 0
-            avg_stall_time = np.mean(recent_stall_times) if recent_stall_times else 0
-            avg_skipped = np.mean(recent_skipped) if recent_skipped else 0 # Average skips
-            avg_played_count = np.mean(recent_played_counts) if recent_played_counts else 0 # Average played
-            avg_speed_val = np.mean(recent_avg_speeds) if recent_avg_speeds else 1.0
-            avg_tau = np.mean(recent_avg_tau_i) if recent_avg_tau_i else 0
-            avg_played_quality = np.mean(recent_avg_qualities) if recent_avg_qualities else 0
-
-            # Modify print statement to include all metrics
-            print(f"Ep {episode+1}/{MAX_EPISODES} | Avg R: {avg_reward:.2f} | Steps: {avg_length:.1f} | "
-                  f"Cap: {avg_capacity_mbps:.2f} | Stall: {avg_stall_time:.2f} | Skip/Play: {avg_skipped:.1f}/{avg_played_count:.1f} | "
-                  f"Speed: {avg_speed_val:.2f}x | τ: {avg_tau:.2f} | Qual: {avg_played_quality:.2f}")
-            # --- End Update ---
-
-            # --- Update Saving (use prefix) ---
-            np.save(f'results/{results_prefix}_episode_rewards.npy', np.array(episode_rewards))
-            np.save(f'results/{results_prefix}_episode_lengths.npy', np.array(episode_lengths))
-            np.save(f'results/{results_prefix}_episode_avg_capacities.npy', np.array(episode_avg_capacities))
-            np.save(f'results/{results_prefix}_episode_stall_times.npy', np.array(episode_stall_times))
-            np.save(f'results/{results_prefix}_episode_skipped.npy', np.array(episode_skipped)) # Save skips
-            np.save(f'results/{results_prefix}_episode_played.npy', np.array(episode_played))   # Save played
-            np.save(f'results/{results_prefix}_episode_avg_speeds.npy', np.array(episode_avg_speeds))
-            np.save(f'results/{results_prefix}_episode_avg_tau_i.npy', np.array(episode_avg_tau_i))
-            np.save(f'results/{results_prefix}_episode_avg_qualities.npy', np.array(episode_avg_qualities))
-            # --- End Update ---
-
-        if (episode + 1) % 5000 == 0:
-            agent.save_models(f'{models_prefix}_episode_{episode + 1}') # Use prefix
-
-    agent.save_models(f'{models_prefix}_final') # Use prefix
-
-
-# #################################
-# Main Execution
-# #################################
-if __name__ == "__main__":
-    print("--- 程序执行开始 (Combined Speed & Skip PPO) ---") # Modified print
-    start_time = time.time()
-    train_combined() # Call the combined training function
-    print(f"总执行时间: {(time.time() - start_time)/60:.2f} 分钟")
-
-
-
+env = Multi_dash_VideoStreamingEnv(dash_dataset=BigBuckBunnyDataset(csv_path="./data/bbb_2s_dataset_approx.csv"))
+print(env.__init__)
